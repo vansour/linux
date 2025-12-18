@@ -1,10 +1,3 @@
-#!/bin/bash
-
-# Debian BBR 优化脚本
-# 适用于 Debian 13+ 系统
-# 作者: GitHub Copilot
-# 日期: $(date +%Y-%m-%d)
-
 set -e  # 遇到错误立即退出
 
 # 颜色定义
@@ -74,18 +67,32 @@ clean_old_config() {
     fi
 }
 
-# 创建新的sysctl配置
+# 创建新的sysctl配置 (核心修改部分)
 create_sysctl_config() {
     log_info "创建新的sysctl配置文件..."
     
     cat > /etc/sysctl.d/99-sysctl.conf << 'EOF'
+# --- BBR & Queue Discipline ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_ecn = 1
 
+# --- 1Gbps+ Cross-border Optimization (Buffer Tuning) ---
+# 核心层：将最大发送/接收缓冲区限制提升至 64MB
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+
+# TCP层：调整自动缓冲区范围 (Min Default Max)
+# 最大值设为 64MB 以覆盖高 BDP 场景 (带宽时延积)
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
+
+# 行为优化：关闭空闲后的慢启动，减少突发延迟
+net.ipv4.tcp_slow_start_after_idle = 0
+
 EOF
     
-    log_success "基础配置已写入 /etc/sysctl.d/99-sysctl.conf"
+    log_success "基础配置及大带宽调优参数已写入 /etc/sysctl.d/99-sysctl.conf"
 }
 
 # IPv6配置选择
@@ -166,6 +173,14 @@ apply_config() {
     else
         log_warning "ECN配置可能未生效"
     fi
+
+    # 简单验证大缓冲区配置
+    local current_rmem_max=$(sysctl net.core.rmem_max | awk '{print $3}')
+    if [[ "$current_rmem_max" -ge 67108864 ]]; then
+        log_success "大带宽缓冲区优化已生效 (Max >= 64MB)"
+    else
+        log_warning "大带宽缓冲区优化可能未生效"
+    fi
 }
 
 # 显示配置摘要
@@ -178,7 +193,7 @@ show_summary() {
     echo "✓ 已启用 BBR 拥塞控制算法"
     echo "✓ 已启用 FQ 队列调度器"
     echo "✓ 已启用 ECN 显式拥塞通知"
-    echo "✓ 已优化 TCP 性能参数"
+    echo "✓ 已应用 1Gbps+ 跨国大带宽专用缓冲区调优 (64MB)"
     
     echo
     log_info "可用命令验证："
@@ -186,14 +201,14 @@ show_summary() {
     echo "  查看可用拥塞控制算法: sysctl net.ipv4.tcp_available_congestion_control"
     echo "  查看当前队列调度器: sysctl net.core.default_qdisc"
     echo "  查看ECN状态: sysctl net.ipv4.tcp_ecn"
-    echo "  查看所有BBR相关配置: sysctl -a | grep bbr"
+    echo "  查看缓冲区设置: sysctl net.core.rmem_max"
     echo
 }
 
 # 主函数
 main() {
     echo "=================================================="
-    echo "          Debian BBR 优化脚本"
+    echo "          Debian BBR & 大带宽优化脚本"
     echo "=================================================="
     echo
     
@@ -205,7 +220,8 @@ main() {
     echo "2. 清空 /etc/sysctl.d/ 目录"
     echo "3. 创建新的 /etc/sysctl.d/99-sysctl.conf"
     echo "4. 启用 BBR、FQ、ECN 优化"
-    echo "5. 配置 IPv6（可选）"
+    echo "5. 应用 64MB 缓冲区以支持 1Gbps+ 跨国传输"
+    echo "6. 配置 IPv6（可选）"
     echo
     
     read -p "是否继续? [y/N]: " confirm
