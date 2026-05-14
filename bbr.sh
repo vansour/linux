@@ -8,8 +8,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 CONFIG_FILE="/etc/sysctl.d/99-custom-network.conf"
+GRUB_FILE="/etc/default/grub"
 IPV6_MODE="skip"
 IPV6_STATUS="未修改"
+IPV6_BOOT_STATUS="未修改"
+REBOOT_REQUIRED=0
 
 # 日志函数
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -32,7 +35,8 @@ check_system() {
         log_error "此脚本仅适用于Debian系统！"
         exit 1
     fi
-    local debian_version=$(cat /etc/debian_version)
+    local debian_version
+    debian_version=$(cat /etc/debian_version)
     log_info "检测到Debian版本: $debian_version"
 }
 
@@ -60,15 +64,15 @@ EOF
 configure_ipv6() {
     echo
     log_info "IPv6 配置选项："
-    echo "1) 禁用 IPv6"
+    echo "1) 永久禁用 IPv6"
     echo "2) 启用 IPv6"
     echo "3) 跳过 IPv6 配置"
     
     while true; do
-        read -p "请选择 IPv6 配置 [1-3]: " ipv6_choice
+        read -r -p "请选择 IPv6 配置 [1-3]: " ipv6_choice
         case $ipv6_choice in
             1)
-                log_info "配置禁用IPv6..."
+                log_info "配置永久禁用IPv6..."
                 IPV6_MODE="disable"
                 cat >> "$CONFIG_FILE" << 'EOF'
 
@@ -105,6 +109,151 @@ EOF
                 ;;
         esac
     done
+}
+
+refresh_grub_config() {
+    if [[ "${SKIP_BOOTLOADER_UPDATE:-0}" == "1" ]]; then
+        log_info "已跳过刷新GRUB配置"
+        return 0
+    fi
+
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+        return $?
+    fi
+
+    if command -v grub-mkconfig >/dev/null 2>&1 && [[ -d /boot/grub ]]; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+        return $?
+    fi
+
+    log_warning "未找到 update-grub 或 grub-mkconfig，请手动刷新引导配置"
+    return 1
+}
+
+update_grub_ipv6_param() {
+    local mode="$1"
+    local tmp_file backup_file
+
+    if [[ ! -f "$GRUB_FILE" ]]; then
+        IPV6_BOOT_STATUS="未找到GRUB配置"
+        log_warning "未找到 ${GRUB_FILE}，无法写入内核启动参数 ipv6.disable=1"
+        return 1
+    fi
+
+    tmp_file=$(mktemp)
+    awk -v mode="$mode" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+
+        function unquote(value) {
+            value = trim(value)
+            if (value ~ /^"/ && value ~ /"$/) {
+                sub(/^"/, "", value)
+                sub(/"$/, "", value)
+            }
+            return value
+        }
+
+        function remove_ipv6_disable(value, parts, count, i, result) {
+            value = unquote(value)
+            count = split(value, parts, /[[:space:]]+/)
+            result = ""
+            for (i = 1; i <= count; i++) {
+                if (parts[i] == "" || parts[i] ~ /^ipv6\.disable=/) {
+                    continue
+                }
+                result = result (result == "" ? "" : " ") parts[i]
+            }
+            return result
+        }
+
+        BEGIN {
+            found = 0
+        }
+
+        /^[[:space:]]*GRUB_CMDLINE_LINUX=/ {
+            found = 1
+            key = $0
+            sub(/=.*/, "", key)
+            value = $0
+            sub(/^[^=]*=/, "", value)
+            value = remove_ipv6_disable(value)
+            if (mode == "disable") {
+                value = value (value == "" ? "" : " ") "ipv6.disable=1"
+            }
+            print key "=\"" value "\""
+            next
+        }
+
+        {
+            print
+        }
+
+        END {
+            if (!found) {
+                if (mode == "disable") {
+                    print "GRUB_CMDLINE_LINUX=\"ipv6.disable=1\""
+                } else {
+                    print "GRUB_CMDLINE_LINUX=\"\""
+                }
+            }
+        }
+    ' "$GRUB_FILE" > "$tmp_file"
+
+    if cmp -s "$GRUB_FILE" "$tmp_file"; then
+        rm -f "$tmp_file"
+        if [[ "$mode" == "disable" ]]; then
+            IPV6_BOOT_STATUS="已存在 ipv6.disable=1"
+            log_success "GRUB已配置 ipv6.disable=1"
+        else
+            IPV6_BOOT_STATUS="未设置内核级禁用参数"
+            log_success "GRUB未设置 ipv6.disable 参数"
+        fi
+        return 0
+    fi
+
+    backup_file="${GRUB_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$GRUB_FILE" "$backup_file"
+    mv "$tmp_file" "$GRUB_FILE"
+    log_success "已更新 ${GRUB_FILE}，备份文件：${backup_file}"
+
+    if refresh_grub_config; then
+        REBOOT_REQUIRED=1
+        if [[ "$mode" == "disable" ]]; then
+            IPV6_BOOT_STATUS="已写入 ipv6.disable=1，重启后永久禁用"
+            log_success "已写入内核启动参数 ipv6.disable=1"
+        else
+            IPV6_BOOT_STATUS="已移除 ipv6.disable 参数，重启后允许启用"
+            log_success "已移除内核启动参数 ipv6.disable"
+        fi
+        return 0
+    fi
+
+    REBOOT_REQUIRED=1
+    if [[ "$mode" == "disable" ]]; then
+        IPV6_BOOT_STATUS="已修改GRUB文件，但引导配置未刷新"
+    else
+        IPV6_BOOT_STATUS="已移除GRUB参数，但引导配置未刷新"
+    fi
+    return 1
+}
+
+apply_ipv6_boot_config() {
+    case "$IPV6_MODE" in
+        disable)
+            update_grub_ipv6_param "disable" || true
+            ;;
+        enable)
+            update_grub_ipv6_param "enable" || true
+            ;;
+        *)
+            IPV6_BOOT_STATUS="未修改"
+            ;;
+    esac
 }
 
 # 运行时逐个网卡应用IPv6开关，避免仅写入all/default后新系统或热插拔网卡未生效
@@ -241,11 +390,14 @@ apply_config() {
     fi
 
     apply_ipv6_runtime_config
+    apply_ipv6_boot_config
     
     # 验证BBR是否启用
     log_info "验证BBR配置..."
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-    local current_congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    local current_qdisc
+    local current_congestion
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    current_congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     
     if [[ "$current_qdisc" == "fq" ]] && [[ "$current_congestion" == "bbr" ]]; then
         log_success "BBR与FQ已成功启用!"
@@ -267,6 +419,7 @@ show_summary() {
     echo "✓ 已启用 FQ 队列调度器"
     echo "✓ 已启用 ECN 显式拥塞通知"
     echo "✓ IPv6 状态：$IPV6_STATUS"
+    echo "✓ IPv6 启动参数：$IPV6_BOOT_STATUS"
     echo "=================================================="
     echo
 }
@@ -284,11 +437,11 @@ main() {
     echo "此脚本将安全地执行以下操作："
     echo "1. 生成独立的网络配置文件 (/etc/sysctl.d/99-custom-network.conf)"
     echo "2. 开启 BBR、FQ 与 ECN 优化"
-    echo "3. 交互式配置 IPv6 状态"
+    echo "3. 交互式配置 IPv6 状态（禁用时写入内核启动参数）"
     echo "4. 加载配置并验证"
     echo
     
-    read -p "是否继续? [y/N]: " confirm
+    read -r -p "是否继续? [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "操作已取消"
         exit 0
@@ -299,6 +452,10 @@ main() {
     configure_ipv6
     apply_config
     show_summary
+
+    if [[ "$REBOOT_REQUIRED" -eq 1 ]]; then
+        log_warning "已修改内核启动参数，请重启系统使永久IPv6配置完全生效。"
+    fi
     
     log_success "安全优化完成！部分现存的 TCP 连接可能需要重启系统才能完全应用新规则。"
 }
