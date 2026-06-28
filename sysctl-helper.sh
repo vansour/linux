@@ -115,7 +115,7 @@ detect_sshd_service() {
 # ─── 主菜单 ───
 
 print_banner() {
-    clear
+    clear 2>/dev/null || true
     echo -e "${C_BOLD}${C_BLUE}"
     echo "╔══════════════════════════════════════════╗"
     echo "║       Linux 系统配置助手                 ║"
@@ -142,12 +142,12 @@ main_menu() {
         echo ""
 
         case "$choice" in
-            1) func_enable_bbr ;;
-            2) func_enable_ntp ;;
-            3) func_change_ssh_port ;;
-            4) func_enable_root_login ;;
-            5) func_remove_keys ;;
-            6) func_show_status ;;
+            1) func_enable_bbr || msg_err "操作失败" ;;
+            2) func_enable_ntp || msg_err "操作失败" ;;
+            3) func_change_ssh_port || msg_err "操作失败" ;;
+            4) func_enable_root_login || msg_err "操作失败" ;;
+            5) func_remove_keys || msg_err "操作失败" ;;
+            6) func_show_status || msg_err "操作失败" ;;
             0) msg_info "再见！"; exit 0 ;;
             *) msg_err "无效选项，请重试" ;&
         esac
