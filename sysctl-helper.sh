@@ -121,43 +121,20 @@ func_enable_bbr_stage1_clean() {
     msg_bold "阶段一：清空现有拥塞控制配置"
     echo ""
 
-    # 清空 /etc/sysctl.d/ 下的 BBR 相关文件
-    local cleaned=0
-    if [[ -f "$BBR_CONF" ]]; then
-        backup_file "$BBR_CONF"
-        rm -f "$BBR_CONF"
-        msg_info "已删除: $BBR_CONF"
-        cleaned=1
-    fi
-
-    # 扫描 sysctl.d 下所有 .conf，包含拥塞控制参数的直接删除整个文件
-    local targets=("net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_ecn")
+    # 删除所有 sysctl 配置文件
     if [[ -d "$SYSTCLD_DIR" ]]; then
+        local count=0
         while IFS= read -r -d '' f; do
-            [[ ! -f "$f" ]] && continue
-            for key in "${targets[@]}"; do
-                if grep -qE "^\s*${key}\s*=" "$f" 2>/dev/null; then
-                    backup_file "$f"
-                    rm -f "$f"
-                    msg_info "已删除: $f (包含 $key)"
-                    cleaned=1
-                    break  # 文件已删除，无需检查其他 key
-                fi
-            done
+            rm -f "$f"
+            msg_info "已删除: $f"
+            ((count++))
         done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
+        [[ $count -gt 0 ]] && msg_info "共删除 $count 个文件"
     fi
 
-    # 检查 /etc/sysctl.conf（已弃用），包含目标参数则直接删除
     if [[ -f /etc/sysctl.conf ]]; then
-        for key in "${targets[@]}"; do
-            if grep -qE "^\s*${key}\s*=" /etc/sysctl.conf 2>/dev/null; then
-                backup_file /etc/sysctl.conf
-                rm -f /etc/sysctl.conf
-                msg_info "已删除: /etc/sysctl.conf (包含 $key，此文件已弃用)"
-                cleaned=1
-                break
-            fi
-        done
+        rm -f /etc/sysctl.conf
+        msg_info "已删除: /etc/sysctl.conf (已弃用)"
     fi
 
     # 重置当前内核参数
