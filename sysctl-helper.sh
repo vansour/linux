@@ -517,6 +517,130 @@ EOF
     msg_ok "功能 3 执行完毕。"
 }
 
+# ─── 功能 4：开启 root 密码登录 ───
+
+func_enable_root_login() {
+    echo ""
+    msg_bold "══════════ 功能 4：开启 root 密码登录 ══════════"
+    echo ""
+
+    local sshd_svc
+    sshd_svc=$(detect_sshd_service)
+    msg_info "SSH 服务: $sshd_svc"
+
+    msg_info "此操作将:"
+    echo "  - 设置 PermitRootLogin yes (主配置 + drop-in 目录)"
+    echo "  - 设置 PasswordAuthentication yes (主配置 + drop-in 目录)"
+    echo "  - 检查 root 密码状态"
+    echo ""
+
+    msg_warn "⚠  确保你理解安全风险：root + 密码登录容易被暴力破解。"
+    echo "⚠  建议同时配置 fail2ban 或使用强密码。"
+
+    confirm "是否继续？" || { msg_info "已取消"; return; }
+
+    # 备份
+    backup_file "$SSHD_CONFIG"
+    backup_dir "$SSHD_CONFIG_D"
+
+    # 辅助函数：注释特定 key 在指定文件中的所有行
+    _comment_key() {
+        local file="$1" key="$2"
+        if [[ -f "$file" ]] && grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
+            sed -i "s|^\\(\\s*${key}\\s\\+\\)|# \\1|" "$file"
+            msg_info "已注释 $file 中的 $key"
+        fi
+    }
+
+    # 辅助函数：设置 key value 在指定文件中
+    _set_key() {
+        local file="$1" key="$2" value="$3"
+        if grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
+            sed -i "s|^\\s*${key}\\s\\+.*|${key} ${value}|" "$file"
+        elif grep -qE "^\s*#\s*${key}\s+" "$file" 2>/dev/null; then
+            sed -i "s|^#\\s*${key}\\s\\+.*|${key} ${value}|" "$file"
+        else
+            echo "${key} ${value}" >> "$file"
+        fi
+        msg_info "已设置 $file: ${key} ${value}"
+    }
+
+    # 1. 处理主配置
+    _set_key "$SSHD_CONFIG" "PermitRootLogin" "yes"
+    _set_key "$SSHD_CONFIG" "PasswordAuthentication" "yes"
+    # 清除 AuthenticationMethods（如存在则注释，因为可能强制密钥认证）
+    sed -i 's/^\(\s*AuthenticationMethods\s\+\)/# \1/' "$SSHD_CONFIG" 2>/dev/null || true
+
+    # 2. 处理 drop-in 目录 — DMIT 等厂商常用此覆盖配置
+    if [[ -d "$SSHD_CONFIG_D" ]]; then
+        local dropins=()
+        while IFS= read -r -d '' f; do
+            dropins+=("$f")
+        done < <(find "$SSHD_CONFIG_D" -name '*.conf' -type f -print0 2>/dev/null || true)
+        for f in "${dropins[@]}"; do
+            [[ ! -f "$f" ]] && continue
+            msg_info "处理 drop-in: $f"
+            # 注释所有可能限制密码/root 登录的行
+            sed -i 's/^\(\s*PermitRootLogin\s\+prohibit-password\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PermitRootLogin\s\+no\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PermitRootLogin\s\+forced-commands-only\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PasswordAuthentication\s\+no\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*AuthenticationMethods\s\+\)/# \1/' "$f" 2>/dev/null || true
+        done
+
+        # 创建我们的覆盖配置（确保最高优先级）
+        local override_conf="${SSHD_CONFIG_D}/99-sysctl-helper-root-login.conf"
+        cat > "$override_conf" <<'EOF'
+# Root 密码登录 — 由 sysctl-helper 设置
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+        msg_ok "已写入 $override_conf"
+    fi
+
+    # 3. 检查 root 密码状态
+    echo ""
+    local passwd_status
+    passwd_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
+    msg_info "root 密码状态: $passwd_status"
+    case "$passwd_status" in
+        P)
+            msg_ok "root 密码已设置 ✓"
+            ;;
+        L)
+            msg_warn "root 账户已锁定 (L)，正在解锁..."
+            passwd -u root 2>/dev/null && msg_ok "root 已解锁" || msg_err "解锁失败，请手动执行: passwd -u root"
+            echo ""
+            msg_warn "root 账户已解锁但密码状态未知，请立即设置密码:"
+            passwd root
+            ;;
+        NP|*)
+            msg_warn "root 密码未设置或状态未知 ($passwd_status)，请设置密码:"
+            passwd root
+            ;;
+    esac
+
+    # 4. 重启 sshd
+    echo ""
+    if sshd -t 2>/dev/null; then
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
+        msg_ok "$sshd_svc 服务已重启"
+    else
+        msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
+        return
+    fi
+
+    # 5. 验证
+    echo ""
+    msg_bold "验证当前 SSH 配置:"
+    if command -v sshd &>/dev/null; then
+        sshd -T 2>/dev/null | grep -E 'permitrootlogin|passwordauthentication' || true
+    fi
+
+    msg_ok "功能 4 执行完毕。"
+    msg_info "请测试: ssh root@<ip> 确认密码登录可用。"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
