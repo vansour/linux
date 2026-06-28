@@ -416,6 +416,107 @@ func_enable_ntp() {
     msg_ok "功能 2 执行完毕。"
 }
 
+# ─── 功能 3：修改 SSH 端口 ───
+
+func_change_ssh_port() {
+    echo ""
+    msg_bold "══════════ 功能 3：修改 SSH 端口 ══════════"
+    echo ""
+
+    local sshd_svc
+    sshd_svc=$(detect_sshd_service)
+    msg_info "检测到 SSH 服务: $sshd_svc"
+
+    # 显示当前端口
+    echo ""
+    echo -e "${C_BLUE}当前 SSH 监听端口:${C_RESET}"
+    if command -v sshd &>/dev/null; then
+        sshd -T 2>/dev/null | grep -E '^port ' || ss -tlnp 2>/dev/null | grep -E 'sshd?'
+    else
+        ss -tlnp 2>/dev/null | grep -E 'sshd?'
+    fi
+    echo ""
+
+    # 读取新端口
+    local new_port
+    while true; do
+        echo -ne "${C_BOLD}请输入新的 SSH 端口号 (1-65535): ${C_RESET}"
+        read -r new_port
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]]; then
+            break
+        fi
+        msg_err "无效端口: $new_port，请输入 1-65535 之间的数字。"
+    done
+
+    if [[ "$new_port" -lt 1024 ]]; then
+        msg_warn "端口 $new_port 为保留端口 (<1024)，需 root 权限。SSH 以 root 运行，通常无影响。"
+    fi
+
+    msg_info "此操作将:"
+    echo "  - 备份 $SSHD_CONFIG 及 $SSHD_CONFIG_D"
+    echo "  - 将 SSH 端口修改为 $new_port"
+    echo "  - 检查防火墙 (ufw) 并放行新端口"
+    echo "  - 重启 $sshd_svc 服务"
+    echo ""
+    msg_warn "⚠  操作后请勿关闭当前 SSH 会话！先用新端口另开终端测试连接。"
+
+    confirm "是否继续？" || { msg_info "已取消"; return; }
+
+    # 备份
+    backup_file "$SSHD_CONFIG"
+    backup_dir "$SSHD_CONFIG_D"
+
+    # 修改端口
+    # 优先使用 sshd_config.d 中的覆盖配置
+    local dropin="${SSHD_CONFIG_D}/99-sysctl-helper-port.conf"
+    mkdir -p "$SSHD_CONFIG_D"
+    cat > "$dropin" <<EOF
+# SSH 端口 — 由 sysctl-helper 设置
+Port $new_port
+EOF
+    msg_ok "已写入 $dropin (Port $new_port)"
+
+    # 同时在主配置中修改以确保兼容
+    if grep -qE '^\s*Port\s+' "$SSHD_CONFIG" 2>/dev/null; then
+        sed -i "s|^\\s*Port\\s\\+.*|Port $new_port|" "$SSHD_CONFIG"
+    elif grep -qE '^\s*#\s*Port\s+' "$SSHD_CONFIG" 2>/dev/null; then
+        sed -i "s|^#\\s*Port\\s\\+.*|Port $new_port|" "$SSHD_CONFIG"
+    else
+        echo "Port $new_port" >> "$SSHD_CONFIG"
+    fi
+    msg_info "主配置 $SSHD_CONFIG 已更新 Port $new_port"
+
+    # 防火墙处理
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        msg_info "检测到 ufw 已启用"
+        ufw allow "$new_port"/tcp 2>/dev/null && msg_ok "ufw 已放行 $new_port/tcp"
+        confirm "是否删除旧端口 (22) 的 ufw 规则？" && {
+            ufw delete allow 22/tcp 2>/dev/null && msg_info "已删除旧端口规则"
+        }
+    else
+        msg_info "ufw 未启用或未安装，跳过防火墙配置"
+    fi
+
+    # 语法检查后重启
+    if sshd -t 2>/dev/null; then
+        msg_ok "sshd_config 语法检查通过"
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || {
+            msg_err "SSH 服务重启失败！请手动检查配置"
+            return
+        }
+        msg_ok "$sshd_svc 服务已重启"
+    else
+        msg_err "sshd_config 语法检查失败！已保留备份文件，请手动修复后重启。"
+        return
+    fi
+
+    echo ""
+    msg_bold "新端口: $new_port"
+    msg_warn "请立即另开终端测试: ssh -p $new_port $(whoami)@$(hostname -I | awk '{print $1}')"
+    echo ""
+    msg_ok "功能 3 执行完毕。"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
