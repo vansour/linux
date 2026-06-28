@@ -319,6 +319,141 @@ func_enable_bbr() {
 
 # ─── 功能 2：开启时间同步 (NTP) ───
 
+func_select_timezone() {
+    # 返回: 选中的 timezone 写入全局变量 SELECTED_TIMEZONE
+    SELECTED_TIMEZONE=""
+
+    echo ""
+    msg_bold "── 选择时区 ──"
+    echo ""
+    echo "  0. 跳过（不修改时区）"
+    echo "  1. 手动输入时区名称"
+    echo "  2. 搜索时区（输入关键词）"
+    echo "  3. 常用时区列表"
+    echo ""
+
+    local tz_choice
+    echo -ne "${C_BOLD}请选择 [0-3]: ${C_RESET}"
+    read -r tz_choice
+
+    case "$tz_choice" in
+        0)
+            msg_info "跳过时区设置"
+            ;;
+        1)
+            echo ""
+            echo -ne "${C_BOLD}请输入时区名称（如 Asia/Shanghai）: ${C_RESET}"
+            read -r SELECTED_TIMEZONE
+            ;;
+        2)
+            echo ""
+            echo -ne "${C_BOLD}输入搜索关键词（如 Shanghai、Tokyo、New_York）: ${C_RESET}"
+            local keyword
+            read -r keyword
+            echo ""
+            if [[ -n "$keyword" ]]; then
+                timedatectl list-timezones 2>/dev/null | grep -i "$keyword" || msg_warn "未找到匹配 \"$keyword\" 的时区"
+                echo ""
+                echo -ne "${C_BOLD}从上方列表输入时区名称: ${C_RESET}"
+                read -r SELECTED_TIMEZONE
+            fi
+            ;;
+        3)
+            echo ""
+            echo "  Asia  │  美洲    │  欧洲     │  大洋洲   │  非洲"
+            echo "  ──────│──────────│──────────│──────────│──────────"
+            echo "  1. Shanghai  7. New_York   13. London   19. Sydney   25. Cairo"
+            echo "  2. Tokyo     8. Chicago    14. Paris    20. Auckland 26. Johannesburg"
+            echo "  3. Singapore 9. Los_Angeles 15. Berlin  21. Melbourne"
+            echo "  4. Hong_Kong 10. Vancouver 16. Moscow"
+            echo "  5. Dubai     11. Toronto   17. Amsterdam"
+            echo "  6. Kolkata   12. Sao_Paulo 18. Zurich"
+            echo ""
+            local common=(
+                "Asia/Shanghai" "Asia/Tokyo" "Asia/Singapore" "Asia/Hong_Kong"
+                "Asia/Dubai" "Asia/Kolkata"
+                "America/New_York" "America/Chicago" "America/Los_Angeles"
+                "America/Vancouver" "America/Toronto" "America/Sao_Paulo"
+                "Europe/London" "Europe/Paris" "Europe/Berlin" "Europe/Moscow"
+                "Europe/Amsterdam" "Europe/Zurich"
+                "Australia/Sydney" "Pacific/Auckland" "Australia/Melbourne"
+                "Africa/Cairo" "Africa/Johannesburg"
+            )
+            echo -ne "${C_BOLD}输入编号 (1-${#common[@]}): ${C_RESET}"
+            local tz_num
+            read -r tz_num
+            if [[ "$tz_num" =~ ^[0-9]+$ ]] && [[ "$tz_num" -ge 1 ]] && [[ "$tz_num" -le ${#common[@]} ]]; then
+                SELECTED_TIMEZONE="${common[$((tz_num - 1))]}"
+            else
+                msg_err "无效编号"
+            fi
+            ;;
+        *)
+            msg_err "无效选项"
+            ;;
+    esac
+
+    if [[ -n "$SELECTED_TIMEZONE" ]]; then
+        # 验证时区是否存在
+        if timedatectl list-timezones 2>/dev/null | grep -qxF "$SELECTED_TIMEZONE"; then
+            msg_ok "已选择时区: $SELECTED_TIMEZONE"
+        else
+            msg_err "无效时区: $SELECTED_TIMEZONE"
+            SELECTED_TIMEZONE=""
+        fi
+    fi
+}
+
+func_select_ntp_server() {
+    # 返回: 选中的 NTP 服务器列表写入全局变量 SELECTED_NTP_SERVERS
+    # 显示常用 NTP 服务器，支持多选（空格分隔）
+    SELECTED_NTP_SERVERS=""
+
+    echo ""
+    msg_bold "── 选择 NTP 服务器 ──"
+    echo ""
+    echo "  [全球]"
+    echo "  1. pool.ntp.org          (全球通用)"
+    echo "  2. time.google.com        (Google)"
+    echo "  3. time.cloudflare.com    (Cloudflare)"
+    echo "  4. time.windows.com       (Microsoft)"
+    echo ""
+    echo "  [中国]"
+    echo "  5. ntp.aliyun.com         (阿里云)"
+    echo "  6. ntp.tencent.com        (腾讯云)"
+    echo "  7. cn.pool.ntp.org        (中国区)"
+    echo "  8. hk.pool.ntp.org        (香港区)"
+    echo ""
+    echo "  0. 手动输入"
+    echo ""
+
+    echo -ne "${C_BOLD}输入编号 (默认 1): ${C_RESET}"
+    local ntp_choice
+    read -r ntp_choice
+    ntp_choice="${ntp_choice:-1}"
+
+    case "$ntp_choice" in
+        1) SELECTED_NTP_SERVERS="pool.ntp.org" ;;
+        2) SELECTED_NTP_SERVERS="time.google.com" ;;
+        3) SELECTED_NTP_SERVERS="time.cloudflare.com" ;;
+        4) SELECTED_NTP_SERVERS="time.windows.com" ;;
+        5) SELECTED_NTP_SERVERS="ntp.aliyun.com" ;;
+        6) SELECTED_NTP_SERVERS="ntp.tencent.com" ;;
+        7) SELECTED_NTP_SERVERS="cn.pool.ntp.org" ;;
+        8) SELECTED_NTP_SERVERS="hk.pool.ntp.org" ;;
+        0)
+            echo -ne "${C_BOLD}请输入 NTP 服务器地址: ${C_RESET}"
+            read -r SELECTED_NTP_SERVERS
+            ;;
+        *)
+            msg_warn "无效选项，使用默认: pool.ntp.org"
+            SELECTED_NTP_SERVERS="pool.ntp.org"
+            ;;
+    esac
+
+    msg_ok "已选择 NTP 服务器: $SELECTED_NTP_SERVERS"
+}
+
 func_enable_ntp() {
     echo ""
     msg_bold "══════════ 功能 2：开启时间同步 (NTP) ══════════"
@@ -337,10 +472,11 @@ func_enable_ntp() {
     fi
 
     msg_info "此操作将:"
+    echo "  - 选择并设置时区"
+    echo "  - 选择 NTP 服务器"
     echo "  - 启用 NTP 时间同步"
     if [[ $use_timesyncd -eq 1 ]]; then
         echo "  - 使用 systemd-timesyncd（系统内置）"
-        echo "  - 配置 NTP 服务器: pool.ntp.org"
     else
         echo "  - 安装并使用 chrony"
     fi
@@ -348,20 +484,31 @@ func_enable_ntp() {
 
     confirm "是否继续？" || { msg_info "已取消"; return; }
 
+    # ─── 选择时区 ───
+    func_select_timezone
+    if [[ -n "$SELECTED_TIMEZONE" ]]; then
+        if timedatectl set-timezone "$SELECTED_TIMEZONE" 2>/dev/null; then
+            msg_ok "时区已设置为: $SELECTED_TIMEZONE"
+        else
+            msg_warn "时区设置失败: $SELECTED_TIMEZONE"
+        fi
+    fi
+
+    # ─── 选择 NTP 服务器 ───
+    func_select_ntp_server
+
     if [[ $use_timesyncd -eq 1 ]]; then
         # 配置 NTP 服务器
         if [[ -f "$TIMESYNCD_CONF" ]]; then
             backup_file "$TIMESYNCD_CONF"
             # 取消注释并设置 NTP 服务器
             sed -i 's/^#\s*NTP=/NTP=/' "$TIMESYNCD_CONF"
-            if ! grep -q '^NTP=.*pool.ntp.org' "$TIMESYNCD_CONF" 2>/dev/null; then
-                # 替换已有的 NTP= 行
-                if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
-                    sed -i 's/^NTP=.*/NTP=pool.ntp.org/' "$TIMESYNCD_CONF"
-                else
-                    echo "NTP=pool.ntp.org" >> "$TIMESYNCD_CONF"
-                fi
+            if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
+                sed -i "s|^NTP=.*|NTP=${SELECTED_NTP_SERVERS}|" "$TIMESYNCD_CONF"
+            else
+                echo "NTP=${SELECTED_NTP_SERVERS}" >> "$TIMESYNCD_CONF"
             fi
+            msg_info "NTP 服务器已写入: $TIMESYNCD_CONF"
         fi
 
         # 启用 NTP
@@ -377,6 +524,15 @@ func_enable_ntp() {
         msg_info "安装 chrony..."
         apt update -qq 2>/dev/null
         apt install -y chrony 2>/dev/null || { msg_err "chrony 安装失败"; return; }
+
+        # 配置 chrony NTP 服务器
+        if [[ -f /etc/chrony/chrony.conf ]]; then
+            backup_file /etc/chrony/chrony.conf
+            sed -i 's/^pool .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
+            sed -i 's/^server .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
+            echo "server ${SELECTED_NTP_SERVERS} iburst" >> /etc/chrony/chrony.conf
+            msg_info "NTP 服务器已写入: /etc/chrony/chrony.conf"
+        fi
 
         systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
         msg_ok "chrony 安装并启动完成"
