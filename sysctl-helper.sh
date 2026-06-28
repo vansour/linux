@@ -124,34 +124,42 @@ func_enable_bbr_stage1_clean() {
     # 清空 /etc/sysctl.d/ 下的 BBR 相关文件
     local cleaned=0
     if [[ -f "$BBR_CONF" ]]; then
-        msg_info "删除现有配置文件: $BBR_CONF"
+        backup_file "$BBR_CONF"
         rm -f "$BBR_CONF"
+        msg_info "已删除: $BBR_CONF"
         cleaned=1
     fi
 
-    # 扫描 sysctl.d 下所有 .conf，注释拥塞控制相关行
-    local files=()
-    [[ -f /etc/sysctl.conf ]] && files+=("/etc/sysctl.conf")
+    # 扫描 sysctl.d 下所有 .conf，包含拥塞控制参数的直接删除整个文件
+    local targets=("net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_ecn")
     if [[ -d "$SYSTCLD_DIR" ]]; then
         while IFS= read -r -d '' f; do
-            files+=("$f")
+            [[ ! -f "$f" ]] && continue
+            for key in "${targets[@]}"; do
+                if grep -qE "^\s*${key}\s*=" "$f" 2>/dev/null; then
+                    backup_file "$f"
+                    rm -f "$f"
+                    msg_info "已删除: $f (包含 $key)"
+                    cleaned=1
+                    break  # 文件已删除，无需检查其他 key
+                fi
+            done
         done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
     fi
 
-    local targets=("net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_ecn")
-    for f in "${files[@]}"; do
-        [[ ! -f "$f" ]] && continue
-        backup_file "$f"
-        local modified=0
+    # 检查 /etc/sysctl.conf，若包含目标参数则备份后注释（不完全删除，避免影响其他配置）
+    if [[ -f /etc/sysctl.conf ]]; then
+        local sysctl_modified=0
         for key in "${targets[@]}"; do
-            if grep -qE "^\s*${key}\s*=" "$f" 2>/dev/null; then
-                sed -i "s|^\\(\\s*${key}\\s*=\\)|# \\1|" "$f"
-                msg_info "已注释 $f 中的 $key"
-                modified=1
+            if grep -qE "^\s*${key}\s*=" /etc/sysctl.conf 2>/dev/null; then
+                [[ $sysctl_modified -eq 0 ]] && backup_file /etc/sysctl.conf
+                sed -i "s|^\\(\\s*${key}\\s*=\\)|# \\1|" /etc/sysctl.conf
+                msg_info "已注释 /etc/sysctl.conf 中的 $key"
+                sysctl_modified=1
             fi
         done
-        [[ $modified -eq 1 ]] && cleaned=1
-    done
+        [[ $sysctl_modified -eq 1 ]] && cleaned=1
+    fi
 
     # 重置当前内核参数
     msg_info "将当前拥塞控制重置为系统默认..."
