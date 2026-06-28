@@ -1,3 +1,46 @@
+# Linux 系统配置助手 (sysctl-helper) 实现计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 创建一个纯 Bash 交互式菜单脚本，在 Debian/Ubuntu 上通过数字菜单驱动 BBR+NTP+SSH 系统配置。
+
+**Architecture:** 单文件 `sysctl-helper.sh`，包含工具函数层（颜色/日志/确认/备份）、菜单循环、6 个功能函数。每个功能函数独立可测试，通过菜单派发调用。
+
+**Tech Stack:** Bash 4.0+, systemd, sysctl, modprobe, apt, sshd 配置工具链
+
+## 全局约束
+
+- 纯 Bash，零额外依赖
+- 仅支持 Debian/Ubuntu（apt 生态）
+- 必须以 root 运行（脚本入口检查 EUID）
+- 所有修改操作前自动备份原文件（时间戳格式 `YYYYMMDD-HHMMSS`）
+- `set -euo pipefail` 但菜单循环内需捕获错误
+- 颜色输出：检查 stdout 是否为终端，非 tty 时禁用颜色
+- 目标文件路径：`/root/github/linux/sysctl-helper.sh`
+
+---
+
+## 文件结构
+
+| 文件 | 职责 |
+|------|------|
+| `sysctl-helper.sh` | 全部代码：常量、工具函数、菜单、6 个功能函数 |
+
+---
+
+### Task 1: 脚本骨架 — 常量、工具函数、菜单循环、入口
+
+**Files:**
+- Create: `sysctl-helper.sh`
+
+**Interfaces:**
+- Produces: `check_root()`, `check_os()`, `msg_ok()`, `msg_warn()`, `msg_err()`, `msg_info()`, `confirm()`, `backup_file()`, `main_menu()`, `main()`
+
+- [ ] **Step 1: 创建脚本文件头、颜色常量和基础工具函数**
+
+写入 `sysctl-helper.sh`:
+
+```bash
 #!/bin/bash
 
 # sysctl-helper.sh — Linux 系统配置助手
@@ -111,9 +154,105 @@ detect_sshd_service() {
         echo "sshd"
     fi
 }
+```
 
-# ─── 功能函数 ───
+- [ ] **Step 2: 添加主菜单和入口函数**
 
+追加到 `sysctl-helper.sh`:
+
+```bash
+# ─── 主菜单 ───
+
+print_banner() {
+    clear
+    echo -e "${C_BOLD}${C_BLUE}"
+    echo "╔══════════════════════════════════════════╗"
+    echo "║       Linux 系统配置助手                 ║"
+    echo "╠══════════════════════════════════════════╣"
+    echo -e "║  检测系统: $(get_os_name)  ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo -e "${C_RESET}"
+}
+
+main_menu() {
+    while true; do
+        print_banner
+        echo "  1. 开启 BBR + fq + ECN + bpftune"
+        echo "  2. 开启时间同步 (NTP)"
+        echo "  3. 修改 SSH 端口"
+        echo "  4. 开启 root 密码登录"
+        echo "  5. 删除 SSH 密钥，仅用密码登录"
+        echo "  6. 查看当前状态"
+        echo "  0. 退出"
+        echo ""
+        local choice
+        echo -ne "${C_BOLD}请输入选项 [0-6]: ${C_RESET}"
+        read -r choice
+        echo ""
+
+        case "$choice" in
+            1) func_enable_bbr ;;
+            2) func_enable_ntp ;;
+            3) func_change_ssh_port ;;
+            4) func_enable_root_login ;;
+            5) func_remove_keys ;;
+            6) func_show_status ;;
+            0) msg_info "再见！"; exit 0 ;;
+            *) msg_err "无效选项，请重试" ;&
+        esac
+
+        if [[ "$choice" =~ ^[1-6]$ ]]; then
+            echo ""
+            echo -ne "${C_BOLD}按 Enter 返回菜单...${C_RESET}"
+            read -r
+        fi
+    done
+}
+
+main() {
+    check_root
+    check_os || exit 1
+    main_menu
+}
+
+# 如果直接执行（非 source），则启动
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+```
+
+- [ ] **Step 3: 验证脚本可执行**
+
+```bash
+chmod +x /root/github/linux/sysctl-helper.sh
+bash -n /root/github/linux/sysctl-helper.sh  # 语法检查，应无输出
+```
+
+Expected: 语法检查通过，无错误输出。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加脚本骨架（菜单、工具函数、颜色）"
+```
+
+---
+
+### Task 2: 功能 1 — 开启 BBR + fq + ECN + bpftune
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在 `main_menu` 函数之前插入 `func_enable_bbr`
+
+**Interfaces:**
+- Consumes: `msg_ok`, `msg_warn`, `msg_err`, `msg_info`, `msg_bold`, `confirm`, `backup_file`, `C_*`
+- Produces: `func_enable_bbr()`
+
+- [ ] **Step 1: 实现 `func_enable_bbr` 函数**
+
+在 `sysctl-helper.sh` 的 `main_menu` 函数之前插入（`# ─── 功能函数 ───` 注释后）:
+
+```bash
 # ─── 功能 1：开启 BBR + fq + ECN + bpftune ───
 
 # 返回 0=通过, 1=失败
@@ -121,21 +260,37 @@ func_enable_bbr_stage1_clean() {
     msg_bold "阶段一：清空现有拥塞控制配置"
     echo ""
 
-    # 删除所有 sysctl 配置文件
-    if [[ -d "$SYSTCLD_DIR" ]]; then
-        local count=0
-        while IFS= read -r -d '' f; do
-            rm -f "$f"
-            msg_info "已删除: $f"
-            ((count++))
-        done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
-        [[ $count -gt 0 ]] && msg_info "共删除 $count 个文件"
+    # 清空 /etc/sysctl.d/ 下的 BBR 相关文件
+    local cleaned=0
+    if [[ -f "$BBR_CONF" ]]; then
+        msg_info "删除现有配置文件: $BBR_CONF"
+        rm -f "$BBR_CONF"
+        cleaned=1
     fi
 
-    if [[ -f /etc/sysctl.conf ]]; then
-        rm -f /etc/sysctl.conf
-        msg_info "已删除: /etc/sysctl.conf (已弃用)"
+    # 扫描 sysctl.d 下所有 .conf，注释拥塞控制相关行
+    local files=()
+    [[ -f /etc/sysctl.conf ]] && files+=("/etc/sysctl.conf")
+    if [[ -d "$SYSTCLD_DIR" ]]; then
+        while IFS= read -r -d '' f; do
+            files+=("$f")
+        done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
     fi
+
+    local targets=("net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_ecn")
+    for f in "${files[@]}"; do
+        [[ ! -f "$f" ]] && continue
+        backup_file "$f"
+        local modified=0
+        for key in "${targets[@]}"; do
+            if grep -qE "^\s*${key}\s*=" "$f" 2>/dev/null; then
+                sed -i "s|^\\(\\s*${key}\\s*=\\)|# \\1|" "$f"
+                msg_info "已注释 $f 中的 $key"
+                modified=1
+            fi
+        done
+        [[ $modified -eq 1 ]] && cleaned=1
+    done
 
     # 重置当前内核参数
     msg_info "将当前拥塞控制重置为系统默认..."
@@ -224,7 +379,7 @@ func_enable_bbr_stage3_verify() {
 
     # 检查活跃连接中是否有 bbr
     local bbr_conns
-    bbr_conns=$(ss -ti 2>/dev/null | grep -c 'bbr' || true)
+    bbr_conns=$(ss -ti 2>/dev/null | grep -c 'bbr' || echo "0")
     if [[ "$bbr_conns" -gt 0 ]]; then
         msg_ok "检测到 $bbr_conns 个活跃连接使用 BBR"
     else
@@ -294,23 +449,6 @@ func_enable_bbr_stage4_bpftune() {
 func_enable_bbr() {
     echo ""
     msg_bold "══════════ 功能 1：开启 BBR + fq + ECN + bpftune ══════════"
-    # ── 显示当前状态 ──
-    echo -e "${C_BOLD}── 当前状态 ──${C_RESET}"
-    local _cur_cc
-    _cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    [[ "$_cur_cc" == "bbr" ]] && msg_ok "拥塞控制: $_cur_cc" || msg_warn "拥塞控制: $_cur_cc"
-    local _cur_qdisc
-    _cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-    [[ "$_cur_qdisc" == "fq" ]] && msg_ok "qdisc: $_cur_qdisc" || msg_warn "qdisc: $_cur_qdisc"
-    local _cur_ecn
-    _cur_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
-    [[ "$_cur_ecn" == "1" ]] && msg_ok "ECN: 已启用" || msg_warn "ECN: $_cur_ecn"
-    lsmod 2>/dev/null | grep -q 'tcp_bbr' && msg_ok "BBR 模块: 已加载" || msg_warn "BBR 模块: 未加载"
-    if command -v bpftune &>/dev/null; then
-        systemctl is-active --quiet bpftune 2>/dev/null && msg_ok "bpftune: 运行中" || msg_warn "bpftune: 未运行"
-    else
-        msg_warn "bpftune: 未安装"
-    fi
     echo ""
 
     msg_info "此操作将:"
@@ -333,143 +471,40 @@ func_enable_bbr() {
     echo ""
     msg_ok "功能 1 执行完毕。"
 }
+```
 
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能1 — BBR + fq + ECN + bpftune"
+```
+
+---
+
+### Task 3: 功能 2 — 开启时间同步 (NTP)
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在功能 1 和 `main_menu` 之间插入 `func_enable_ntp`
+
+**Interfaces:**
+- Consumes: 工具函数、常量
+- Produces: `func_enable_ntp()`
+
+- [ ] **Step 1: 实现 `func_enable_ntp` 函数**
+
+在功能 1 函数之后（`main_menu` 之前）插入:
+
+```bash
 # ─── 功能 2：开启时间同步 (NTP) ───
-
-func_select_timezone() {
-    # 返回: 选中的 timezone 写入全局变量 SELECTED_TIMEZONE
-    SELECTED_TIMEZONE=""
-
-    echo ""
-    msg_bold "── 选择时区 ──"
-    echo ""
-    echo "  0. 跳过（不修改时区）"
-    echo "  1. 手动输入时区名称"
-    echo "  2. 搜索时区（输入关键词）"
-    echo "  3. 常用时区列表"
-    echo ""
-
-    local tz_choice
-    echo -ne "${C_BOLD}请选择 [0-3]: ${C_RESET}"
-    read -r tz_choice
-
-    case "$tz_choice" in
-        0)
-            msg_info "跳过时区设置"
-            ;;
-        1)
-            echo ""
-            echo -ne "${C_BOLD}请输入时区名称（如 Asia/Shanghai）: ${C_RESET}"
-            read -r SELECTED_TIMEZONE
-            ;;
-        2)
-            echo ""
-            echo -ne "${C_BOLD}输入搜索关键词（如 Shanghai、Tokyo、New_York）: ${C_RESET}"
-            local keyword
-            read -r keyword
-            echo ""
-            if [[ -n "$keyword" ]]; then
-                timedatectl list-timezones 2>/dev/null | grep -i "$keyword" || msg_warn "未找到匹配 \"$keyword\" 的时区"
-                echo ""
-                echo -ne "${C_BOLD}从上方列表输入时区名称: ${C_RESET}"
-                read -r SELECTED_TIMEZONE
-            fi
-            ;;
-        3)
-            echo ""
-            echo "  Asia  │  美洲    │  欧洲     │  大洋洲   │  非洲"
-            echo "  ──────│──────────│──────────│──────────│──────────"
-            echo "  1. Shanghai  7. New_York   13. London   19. Sydney   25. Cairo"
-            echo "  2. Tokyo     8. Chicago    14. Paris    20. Auckland 26. Johannesburg"
-            echo "  3. Singapore 9. Los_Angeles 15. Berlin  21. Melbourne"
-            echo "  4. Hong_Kong 10. Vancouver 16. Moscow"
-            echo "  5. Dubai     11. Toronto   17. Amsterdam"
-            echo "  6. Kolkata   12. Sao_Paulo 18. Zurich"
-            echo ""
-            local common=(
-                "Asia/Shanghai" "Asia/Tokyo" "Asia/Singapore" "Asia/Hong_Kong"
-                "Asia/Dubai" "Asia/Kolkata"
-                "America/New_York" "America/Chicago" "America/Los_Angeles"
-                "America/Vancouver" "America/Toronto" "America/Sao_Paulo"
-                "Europe/London" "Europe/Paris" "Europe/Berlin" "Europe/Moscow"
-                "Europe/Amsterdam" "Europe/Zurich"
-                "Australia/Sydney" "Pacific/Auckland" "Australia/Melbourne"
-                "Africa/Cairo" "Africa/Johannesburg"
-            )
-            echo -ne "${C_BOLD}输入编号 (1-${#common[@]}): ${C_RESET}"
-            local tz_num
-            read -r tz_num
-            if [[ "$tz_num" =~ ^[0-9]+$ ]] && [[ "$tz_num" -ge 1 ]] && [[ "$tz_num" -le ${#common[@]} ]]; then
-                SELECTED_TIMEZONE="${common[$((tz_num - 1))]}"
-            else
-                msg_err "无效编号"
-            fi
-            ;;
-        *)
-            msg_err "无效选项"
-            ;;
-    esac
-
-    if [[ -n "$SELECTED_TIMEZONE" ]]; then
-        # 验证时区是否存在
-        if timedatectl list-timezones 2>/dev/null | grep -qxF "$SELECTED_TIMEZONE"; then
-            msg_ok "已选择时区: $SELECTED_TIMEZONE"
-        else
-            msg_err "无效时区: $SELECTED_TIMEZONE"
-            SELECTED_TIMEZONE=""
-        fi
-    fi
-}
-
-func_select_ntp_server() {
-    # 返回: 选中的 NTP 服务器列表写入全局变量 SELECTED_NTP_SERVERS
-    # 显示常用 NTP 服务器，支持多选（空格分隔）
-    SELECTED_NTP_SERVERS=""
-
-    echo ""
-    msg_bold "── 选择 NTP 服务器 ──"
-    echo ""
-    echo "  [全球]"
-    echo "  1. pool.ntp.org          (全球通用)"
-    echo "  2. time.google.com        (Google)"
-    echo "  3. time.cloudflare.com    (Cloudflare)"
-    echo "  4. time.windows.com       (Microsoft)"
-    echo ""
-    echo "  [中国]"
-    echo "  5. ntp.aliyun.com         (阿里云)"
-    echo "  6. ntp.tencent.com        (腾讯云)"
-    echo "  7. cn.pool.ntp.org        (中国区)"
-    echo "  8. hk.pool.ntp.org        (香港区)"
-    echo ""
-    echo "  0. 手动输入"
-    echo ""
-
-    echo -ne "${C_BOLD}输入编号 (默认 1): ${C_RESET}"
-    local ntp_choice
-    read -r ntp_choice
-    ntp_choice="${ntp_choice:-1}"
-
-    case "$ntp_choice" in
-        1) SELECTED_NTP_SERVERS="pool.ntp.org" ;;
-        2) SELECTED_NTP_SERVERS="time.google.com" ;;
-        3) SELECTED_NTP_SERVERS="time.cloudflare.com" ;;
-        4) SELECTED_NTP_SERVERS="time.windows.com" ;;
-        5) SELECTED_NTP_SERVERS="ntp.aliyun.com" ;;
-        6) SELECTED_NTP_SERVERS="ntp.tencent.com" ;;
-        7) SELECTED_NTP_SERVERS="cn.pool.ntp.org" ;;
-        8) SELECTED_NTP_SERVERS="hk.pool.ntp.org" ;;
-        0)
-            echo -ne "${C_BOLD}请输入 NTP 服务器地址: ${C_RESET}"
-            read -r SELECTED_NTP_SERVERS
-            ;;
-        *)
-            msg_warn "无效选项，使用默认: pool.ntp.org"
-            SELECTED_NTP_SERVERS="pool.ntp.org"
-            ;;
-    esac
-
-    msg_ok "已选择 NTP 服务器: $SELECTED_NTP_SERVERS"
-}
 
 func_enable_ntp() {
     echo ""
@@ -482,6 +517,7 @@ func_enable_ntp() {
 
     # 检测可用的 NTP 后端
     local use_timesyncd=0
+    local use_chrony=0
 
     if systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
         use_timesyncd=1
@@ -489,11 +525,10 @@ func_enable_ntp() {
     fi
 
     msg_info "此操作将:"
-    echo "  - 选择并设置时区"
-    echo "  - 选择 NTP 服务器"
     echo "  - 启用 NTP 时间同步"
     if [[ $use_timesyncd -eq 1 ]]; then
         echo "  - 使用 systemd-timesyncd（系统内置）"
+        echo "  - 配置 NTP 服务器: pool.ntp.org"
     else
         echo "  - 安装并使用 chrony"
     fi
@@ -501,31 +536,20 @@ func_enable_ntp() {
 
     confirm "是否继续？" || { msg_info "已取消"; return; }
 
-    # ─── 选择时区 ───
-    func_select_timezone
-    if [[ -n "$SELECTED_TIMEZONE" ]]; then
-        if timedatectl set-timezone "$SELECTED_TIMEZONE" 2>/dev/null; then
-            msg_ok "时区已设置为: $SELECTED_TIMEZONE"
-        else
-            msg_warn "时区设置失败: $SELECTED_TIMEZONE"
-        fi
-    fi
-
-    # ─── 选择 NTP 服务器 ───
-    func_select_ntp_server
-
     if [[ $use_timesyncd -eq 1 ]]; then
         # 配置 NTP 服务器
         if [[ -f "$TIMESYNCD_CONF" ]]; then
             backup_file "$TIMESYNCD_CONF"
             # 取消注释并设置 NTP 服务器
             sed -i 's/^#\s*NTP=/NTP=/' "$TIMESYNCD_CONF"
-            if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
-                sed -i "s|^NTP=.*|NTP=${SELECTED_NTP_SERVERS}|" "$TIMESYNCD_CONF"
-            else
-                echo "NTP=${SELECTED_NTP_SERVERS}" >> "$TIMESYNCD_CONF"
+            if ! grep -q '^NTP=.*pool.ntp.org' "$TIMESYNCD_CONF" 2>/dev/null; then
+                # 替换已有的 NTP= 行
+                if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
+                    sed -i 's/^NTP=.*/NTP=pool.ntp.org/' "$TIMESYNCD_CONF"
+                else
+                    echo "NTP=pool.ntp.org" >> "$TIMESYNCD_CONF"
+                fi
             fi
-            msg_info "NTP 服务器已写入: $TIMESYNCD_CONF"
         fi
 
         # 启用 NTP
@@ -541,15 +565,6 @@ func_enable_ntp() {
         msg_info "安装 chrony..."
         apt update -qq 2>/dev/null
         apt install -y chrony 2>/dev/null || { msg_err "chrony 安装失败"; return; }
-
-        # 配置 chrony NTP 服务器
-        if [[ -f /etc/chrony/chrony.conf ]]; then
-            backup_file /etc/chrony/chrony.conf
-            sed -i 's/^pool .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
-            sed -i 's/^server .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
-            echo "server ${SELECTED_NTP_SERVERS} iburst" >> /etc/chrony/chrony.conf
-            msg_info "NTP 服务器已写入: /etc/chrony/chrony.conf"
-        fi
 
         systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
         msg_ok "chrony 安装并启动完成"
@@ -571,7 +586,39 @@ func_enable_ntp() {
     echo ""
     msg_ok "功能 2 执行完毕。"
 }
+```
 
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能2 — NTP 时间同步"
+```
+
+---
+
+### Task 4: 功能 3 — 修改 SSH 端口
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在功能 2 和 `main_menu` 之间插入 `func_change_ssh_port`
+
+**Interfaces:**
+- Consumes: 工具函数、`detect_sshd_service`、常量
+- Produces: `func_change_ssh_port()`
+
+- [ ] **Step 1: 实现 `func_change_ssh_port` 函数**
+
+在功能 2 函数之后插入:
+
+```bash
 # ─── 功能 3：修改 SSH 端口 ───
 
 func_change_ssh_port() {
@@ -672,7 +719,39 @@ EOF
     echo ""
     msg_ok "功能 3 执行完毕。"
 }
+```
 
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能3 — 修改 SSH 端口"
+```
+
+---
+
+### Task 5: 功能 4 — 开启 root 密码登录
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在功能 3 和 `main_menu` 之间插入 `func_enable_root_login`
+
+**Interfaces:**
+- Consumes: 工具函数、`detect_sshd_service`、常量
+- Produces: `func_enable_root_login()`
+
+- [ ] **Step 1: 实现 `func_enable_root_login` 函数**
+
+在功能 3 函数之后插入:
+
+```bash
 # ─── 功能 4：开启 root 密码登录 ───
 
 func_enable_root_login() {
@@ -683,31 +762,6 @@ func_enable_root_login() {
     local sshd_svc
     sshd_svc=$(detect_sshd_service)
     msg_info "SSH 服务: $sshd_svc"
-
-    # ── 显示当前状态 ──
-    echo -e "${C_BOLD}── 当前状态 ──${C_RESET}"
-    if command -v sshd &>/dev/null; then
-        local _prl _pa _am
-        _prl=$(sshd -T 2>/dev/null | grep -E '^permitrootlogin ' | awk '{print $2}' || echo "unknown")
-        _pa=$(sshd -T 2>/dev/null | grep -E '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
-        _am=$(sshd -T 2>/dev/null | grep -E '^authenticationmethods ' | awk '{$1=""; print $0}' | xargs || echo "")
-        case "$_prl" in
-            yes) msg_ok "PermitRootLogin: yes" ;;
-            no|prohibit-password|forced-commands-only) msg_warn "PermitRootLogin: $_prl" ;;
-            *) msg_info "PermitRootLogin: $_prl" ;;
-        esac
-        [[ "$_pa" == "yes" ]] && msg_ok "PasswordAuthentication: yes" || msg_warn "PasswordAuthentication: $_pa"
-        [[ -n "$_am" ]] && msg_warn "AuthenticationMethods: $_am" || msg_ok "AuthenticationMethods: 无限制"
-    fi
-    local _ps
-    _ps=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "unknown")
-    case "$_ps" in
-        P) msg_ok "root 密码: 已设置" ;;
-        L) msg_warn "root 密码: 已锁定" ;;
-        NP) msg_warn "root 密码: 未设置" ;;
-        *) msg_info "root 密码: $_ps" ;;
-    esac
-    echo ""
 
     msg_info "此操作将:"
     echo "  - 设置 PermitRootLogin yes (主配置 + drop-in 目录)"
@@ -723,6 +777,15 @@ func_enable_root_login() {
     # 备份
     backup_file "$SSHD_CONFIG"
     backup_dir "$SSHD_CONFIG_D"
+
+    # 辅助函数：注释特定 key 在指定文件中的所有行
+    _comment_key() {
+        local file="$1" key="$2"
+        if [[ -f "$file" ]] && grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
+            sed -i "s|^\\(\\s*${key}\\s\\+\\)|# \\1|" "$file"
+            msg_info "已注释 $file 中的 $key"
+        fi
+    }
 
     # 辅助函数：设置 key value 在指定文件中
     _set_key() {
@@ -795,11 +858,7 @@ EOF
     # 4. 重启 sshd
     echo ""
     if sshd -t 2>/dev/null; then
-        msg_ok "sshd_config 语法检查通过"
-        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || {
-            msg_err "SSH 服务重启失败！请手动检查配置"
-            return
-        }
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
         msg_ok "$sshd_svc 服务已重启"
     else
         msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
@@ -816,7 +875,39 @@ EOF
     msg_ok "功能 4 执行完毕。"
     msg_info "请测试: ssh root@<ip> 确认密码登录可用。"
 }
+```
 
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能4 — 开启 root 密码登录"
+```
+
+---
+
+### Task 6: 功能 5 — 删除 SSH 密钥，仅用密码登录
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在功能 4 和 `main_menu` 之间插入 `func_remove_keys`
+
+**Interfaces:**
+- Consumes: 工具函数、`detect_sshd_service`、常量
+- Produces: `func_remove_keys()`, `func_remove_keys_scan()`
+
+- [ ] **Step 1: 实现扫描函数和主函数**
+
+在功能 4 函数之后插入:
+
+```bash
 # ─── 功能 5：删除 SSH 密钥，仅用密码登录 ───
 
 func_remove_keys_scan() {
@@ -830,7 +921,7 @@ func_remove_keys_scan() {
     # 1. 检查 authorized_keys
     if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
         local key_count
-        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || true)
+        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "?")
         SCAN_RESULTS+=("/root/.ssh/authorized_keys:${key_count} 个 SSH 公钥")
         msg_warn "发现: /root/.ssh/authorized_keys 中有 ${key_count} 个公钥"
     fi
@@ -842,7 +933,7 @@ func_remove_keys_scan() {
             local user
             user=$(basename "$home")
             local cnt
-            cnt=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$authkeys" 2>/dev/null || true)
+            cnt=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$authkeys" 2>/dev/null || echo "?")
             SCAN_RESULTS+=("${authkeys}:用户 $user 有 ${cnt} 个公钥 (仅报告，不操作)")
             msg_info "发现: ${authkeys} (用户 $user, ${cnt} 个密钥) — 仅报告"
         fi
@@ -870,6 +961,8 @@ func_remove_keys_scan() {
     if [[ -d "$SSHD_CONFIG_D" ]]; then
         while IFS= read -r -d '' f; do
             [[ ! -f "$f" ]] && continue
+            local name
+            name=$(basename "$f")
 
             if grep -qE '^\s*PasswordAuthentication\s+no' "$f" 2>/dev/null; then
                 SCAN_RESULTS+=("${f}:PasswordAuthentication no [vendor drop-in]")
@@ -995,7 +1088,7 @@ func_remove_keys() {
     backup_file "$SSHD_CONFIG"
     backup_dir "$SSHD_CONFIG_D"
 
-    # 辅助函数（复用功能4的模式）
+    # 辅助函数（复用功能4的模式
     _set_or_comment() {
         local file="$1" key="$2" value="$3" action="$4"
         # action: "set" — 设为 value; "comment" — 注释掉该 key 的所有出现
@@ -1065,11 +1158,7 @@ EOF
     # 4. 重启 sshd
     echo ""
     if sshd -t 2>/dev/null; then
-        msg_ok "sshd_config 语法检查通过"
-        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || {
-            msg_err "SSH 服务重启失败！请手动检查配置"
-            return
-        }
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
         msg_ok "$sshd_svc 服务已重启"
     else
         msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
@@ -1091,515 +1180,290 @@ EOF
     echo "  ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no root@$(hostname -I 2>/dev/null | awk '{print $1}' || echo '<IP>')"
     msg_warn "⚠  测试通过前请勿关闭当前会话！"
 }
-# ─── 功能 6：开启/禁用 IPv6 ───
+```
 
-func_toggle_ipv6() {
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能5 — 删除SSH密钥仅用密码登录（含全部阻止因素扫描）"
+```
+
+---
+
+### Task 7: 功能 6 — 查看当前状态
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 在功能 5 和 `main_menu` 之间插入 `func_show_status`
+
+**Interfaces:**
+- Consumes: 工具函数、常量
+- Produces: `func_show_status()`
+
+- [ ] **Step 1: 实现 `func_show_status` 函数**
+
+在功能 5 函数之后插入:
+
+```bash
+# ─── 功能 6：查看当前状态 ───
+
+func_show_status() {
     echo ""
-    msg_bold "══════════ 功能 6：开启/禁用 IPv6 ══════════"
+    msg_bold "══════════ 功能 6：查看当前状态 ══════════"
     echo ""
 
-    local IPV6_CONF="/etc/sysctl.d/99-disable-ipv6.conf"
-
-    # 显示当前状态
-    local cur_all cur_default
-    cur_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
-    cur_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "0")
-
-    echo -e "${C_BLUE}当前 IPv6 状态:${C_RESET}"
-    if [[ "$cur_all" == "1" ]]; then
-        msg_warn "IPv6 已禁用 (all.disable_ipv6=1)"
+    # ── BBR / 拥塞控制 ──
+    echo -e "${C_BOLD}── 拥塞控制 ──${C_RESET}"
+    local cc_val
+    cc_val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$cc_val" == "bbr" ]]; then
+        msg_ok "拥塞控制算法: $cc_val"
     else
-        msg_ok "IPv6 已启用 (all.disable_ipv6=0)"
+        msg_warn "拥塞控制算法: $cc_val (未启用 BBR)"
     fi
-    echo "  net.ipv6.conf.all.disable_ipv6 = $cur_all"
-    echo "  net.ipv6.conf.default.disable_ipv6 = $cur_default"
 
-    # 检查 GRUB 是否设了 ipv6.disable
-    if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
-        msg_warn "GRUB 内核参数: ipv6.disable=1 (需重启生效)"
-    fi
-    echo ""
-
-    # 子菜单
-    echo "  1. 禁用 IPv6"
-    echo "  2. 开启 IPv6"
-    echo "  0. 返回"
-    echo ""
-
-    local action
-    echo -ne "${C_BOLD}请选择 [0-2]: ${C_RESET}"
-    read -r action
-    echo ""
-
-    case "$action" in
-        1)
-            msg_info "正在禁用 IPv6..."
-            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
-            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
-            # 持久化
-            cat > "$IPV6_CONF" <<'EOF'
-# 禁用 IPv6 — 由 sysctl-helper 设置
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-EOF
-            msg_ok "已写入 $IPV6_CONF"
-            sysctl -p "$IPV6_CONF" >/dev/null 2>&1
-            msg_ok "IPv6 已即时禁用 ✓"
-
-            # 询问是否添加 GRUB 内核参数（完全关闭需重启）
-            echo ""
-            confirm "是否同时添加 ipv6.disable=1 到 GRUB 内核参数？(彻底关闭，需重启生效)" && {
-                backup_file /etc/default/grub
-                if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub 2>/dev/null; then
-                    if ! grep -q 'ipv6.disable=1' /etc/default/grub; then
-                        sed -i 's|^GRUB_CMDLINE_LINUX="\(.*\)"|GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"|' /etc/default/grub
-                        msg_ok "已添加 ipv6.disable=1 到 GRUB"
-                        msg_warn "请手动执行 update-grub 并重启以完全生效"
-                    else
-                        msg_info "GRUB 已包含 ipv6.disable=1"
-                    fi
-                fi
-            }
-            ;;
-        2)
-            msg_info "正在开启 IPv6..."
-
-            # 删除禁用配置文件
-            if [[ -f "$IPV6_CONF" ]]; then
-                rm -f "$IPV6_CONF"
-                msg_info "已删除: $IPV6_CONF"
-            fi
-
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
-            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
-            msg_ok "IPv6 已即时开启 ✓"
-
-            # 询问是否移除 GRUB 参数
-            if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
-                echo ""
-                confirm "是否移除 GRUB 中的 ipv6.disable=1？" && {
-                    backup_file /etc/default/grub
-                    sed -i 's/\s*ipv6\.disable=1//' /etc/default/grub
-                    msg_ok "已从 GRUB 移除 ipv6.disable=1"
-                    msg_warn "请手动执行 update-grub 并重启以完全生效"
-                }
-            fi
-            ;;
-        0)
-            msg_info "已取消"
-            ;;
-        *)
-            msg_err "无效选项"
-            ;;
-    esac
-
-    echo ""
-    msg_ok "功能 6 执行完毕。"
-}
-
-# ─── 功能 7：配置 Swap ───
-
-func_configure_swap() {
-    echo ""
-    msg_bold "══════════ 功能 7：配置 Swap ══════════"
-    echo ""
-
-    local DEFAULT_SWAPFILE="/swapfile"
-    local total_ram_mb
-    total_ram_mb=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
-
-    # ── 显示当前状态 ──
-    echo -e "${C_BOLD}── 当前 Swap 状态 ──${C_RESET}"
-    if swapon --show 2>/dev/null | grep -q .; then
-        swapon --show 2>/dev/null
+    local qdisc_val
+    qdisc_val=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    if [[ "$qdisc_val" == "fq" ]]; then
+        msg_ok "默认 qdisc: $qdisc_val"
     else
-        msg_info "当前未启用任何 Swap"
-    fi
-    echo ""
-    msg_info "物理内存: ${total_ram_mb} MB"
-    echo ""
-
-    # ── 子菜单 ──
-    echo "  1. 添加 Swap"
-    echo "  2. 删除 Swap"
-    echo "  3. 调整 Swap（删除所有现有 Swap 后重建）"
-    echo "  0. 返回"
-    echo ""
-
-    local action
-    echo -ne "${C_BOLD}请选择 [0-3]: ${C_RESET}"
-    read -r action
-    echo ""
-
-    case "$action" in
-        1)
-            # ─── 添加 Swap ───
-            msg_bold "── 添加 Swap ──"
-            echo ""
-
-            # 检查是否已存在 swap 文件
-            if swapon --show 2>/dev/null | grep -qF "$DEFAULT_SWAPFILE"; then
-                msg_warn "$DEFAULT_SWAPFILE 已启用为 Swap，无需重复添加"
-                msg_info "如需调整大小，请使用「调整 Swap」功能"
-                return
-            fi
-
-            if [[ -f "$DEFAULT_SWAPFILE" ]]; then
-                msg_warn "$DEFAULT_SWAPFILE 已存在但不是 Swap 文件"
-                confirm "是否覆盖该文件？" || { msg_info "已取消"; return; }
-                rm -f "$DEFAULT_SWAPFILE"
-            fi
-
-            # 获取 swap 容量
-            local recommended_mb="$total_ram_mb"
-            echo -e "${C_BLUE}物理内存: ${total_ram_mb} MB${C_RESET}"
-            msg_info "建议 Swap 容量: ${recommended_mb} MB（不超过物理内存的最大整数 MB）"
-            echo ""
-
-            local swap_size_mb
-            while true; do
-                echo -ne "${C_BOLD}请输入 Swap 容量 (MB, 默认 ${recommended_mb}): ${C_RESET}"
-                read -r swap_size_mb
-                swap_size_mb="${swap_size_mb:-$recommended_mb}"
-                if [[ "$swap_size_mb" =~ ^[0-9]+$ ]] && [[ "$swap_size_mb" -gt 0 ]]; then
-                    break
-                fi
-                msg_err "无效容量: $swap_size_mb，请输入正整数 (MB)"
-            done
-
-            if [[ "$swap_size_mb" -gt "$total_ram_mb" ]]; then
-                msg_warn "Swap 容量 (${swap_size_mb} MB) 超过物理内存 (${total_ram_mb} MB)"
-                confirm "仍要继续？" || { msg_info "已取消"; return; }
-            fi
-
-            # 检查磁盘空间
-            local avail_kb
-            avail_kb=$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
-            if [[ -n "$avail_kb" ]] && [[ "$avail_kb" -lt $((swap_size_mb * 1024)) ]]; then
-                msg_err "磁盘空间不足！可用: $((avail_kb / 1024)) MB，需要: ${swap_size_mb} MB"
-                return
-            fi
-
-            msg_info "正在创建 Swap 文件: $DEFAULT_SWAPFILE (${swap_size_mb} MB)..."
-            echo ""
-
-            # 创建 swap 文件
-            if dd if=/dev/zero of="$DEFAULT_SWAPFILE" bs=1M count="$swap_size_mb" status=progress 2>/dev/null; then
-                msg_ok "Swap 文件已创建"
-            else
-                msg_err "创建 Swap 文件失败"
-                return
-            fi
-
-            chmod 600 "$DEFAULT_SWAPFILE"
-            msg_info "权限已设为 600"
-
-            if mkswap "$DEFAULT_SWAPFILE" >/dev/null 2>&1; then
-                msg_ok "mkswap 完成"
-            else
-                msg_err "mkswap 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            if swapon "$DEFAULT_SWAPFILE" 2>/dev/null; then
-                msg_ok "swapon 完成，Swap 已启用"
-            else
-                msg_err "swapon 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            # 写入 fstab
-            backup_file /etc/fstab
-            if grep -qF "$DEFAULT_SWAPFILE" /etc/fstab 2>/dev/null; then
-                sed -i "\|^${DEFAULT_SWAPFILE}|s|.*|${DEFAULT_SWAPFILE} none swap sw 0 0|" /etc/fstab
-                msg_info "已更新 /etc/fstab 中的 Swap 条目"
-            else
-                echo "${DEFAULT_SWAPFILE} none swap sw 0 0" >> /etc/fstab
-                msg_info "已添加 Swap 条目到 /etc/fstab"
-            fi
-
-            echo ""
-            msg_bold "当前 Swap 状态:"
-            swapon --show 2>/dev/null
-            msg_ok "Swap 添加完成 ✓"
-            ;;
-
-        2)
-            # ─── 删除 Swap ───
-            msg_bold "── 删除 Swap ──"
-            echo ""
-
-            # 收集所有活动的 swap
-            local swap_devices=()
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                local dev
-                dev=$(echo "$line" | awk '{print $1}')
-                # 跳过标题行
-                [[ "$dev" == "NAME" ]] && continue
-                swap_devices+=("$dev")
-            done < <(swapon --show 2>/dev/null || true)
-
-            if [[ ${#swap_devices[@]} -eq 0 ]]; then
-                msg_info "当前未启用任何 Swap，无需删除"
-                return
-            fi
-
-            echo -e "${C_BOLD}将删除以下 Swap:${C_RESET}"
-            for dev in "${swap_devices[@]}"; do
-                echo "  - $dev"
-            done
-            echo ""
-
-            confirm "确认删除所有 Swap？" || { msg_info "已取消"; return; }
-
-            # 关闭所有 swap
-            if swapoff -a 2>/dev/null; then
-                msg_ok "已关闭所有 Swap"
-            else
-                msg_err "swapoff 失败，请检查是否有进程占用"
-                return
-            fi
-
-            # 删除 swap 文件并清理 fstab
-            for dev in "${swap_devices[@]}"; do
-                if [[ -f "$dev" ]]; then
-                    rm -f "$dev"
-                    msg_info "已删除: $dev"
-                fi
-            done
-
-            # 清理 fstab 中的 swap 条目
-            backup_file /etc/fstab
-            local fstab_modified=0
-            for dev in "${swap_devices[@]}"; do
-                if grep -qF "$dev" /etc/fstab 2>/dev/null; then
-                    sed -i "\|^${dev}|d" /etc/fstab
-                    msg_info "已从 /etc/fstab 移除: $dev"
-                    fstab_modified=1
-                fi
-            done
-            # 同时清理可能引用 /swapfile 的其他行
-            if grep -qE '^\s*/swapfile\s+none\s+swap' /etc/fstab 2>/dev/null; then
-                sed -i '\|^\s*/swapfile\s\+none\s\+swap|d' /etc/fstab
-                msg_info "已从 /etc/fstab 清理 /swapfile 条目"
-                fstab_modified=1
-            fi
-            [[ $fstab_modified -eq 0 ]] && msg_info "/etc/fstab 中无 Swap 条目需要清理"
-
-            echo ""
-            msg_info "当前状态:"
-            swapon --show 2>/dev/null || msg_info "无活动 Swap"
-            msg_ok "Swap 删除完成 ✓"
-            ;;
-
-        3)
-            # ─── 调整 Swap ───
-            msg_bold "── 调整 Swap（删除所有现有 Swap 后重建）──"
-            echo ""
-
-            # 收集当前 swap 信息
-            local old_devices=()
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                local dev
-                dev=$(echo "$line" | awk '{print $1}')
-                [[ "$dev" == "NAME" ]] && continue
-                old_devices+=("$dev")
-            done < <(swapon --show 2>/dev/null || true)
-
-            if [[ ${#old_devices[@]} -gt 0 ]]; then
-                echo -e "${C_BOLD}当前 Swap 将被删除:${C_RESET}"
-                for dev in "${old_devices[@]}"; do
-                    echo "  - $dev"
-                done
-            else
-                msg_info "当前未启用 Swap，将直接创建新的 Swap 文件"
-            fi
-            echo ""
-
-            # 获取新容量
-            local recommended_mb="$total_ram_mb"
-            echo -e "${C_BLUE}物理内存: ${total_ram_mb} MB${C_RESET}"
-            msg_info "建议 Swap 容量: ${recommended_mb} MB（不超过物理内存的最大整数 MB）"
-            echo ""
-
-            local new_size_mb
-            while true; do
-                echo -ne "${C_BOLD}请输入新的 Swap 容量 (MB, 默认 ${recommended_mb}): ${C_RESET}"
-                read -r new_size_mb
-                new_size_mb="${new_size_mb:-$recommended_mb}"
-                if [[ "$new_size_mb" =~ ^[0-9]+$ ]] && [[ "$new_size_mb" -gt 0 ]]; then
-                    break
-                fi
-                msg_err "无效容量: $new_size_mb，请输入正整数 (MB)"
-            done
-
-            if [[ "$new_size_mb" -gt "$total_ram_mb" ]]; then
-                msg_warn "Swap 容量 (${new_size_mb} MB) 超过物理内存 (${total_ram_mb} MB)"
-                confirm "仍要继续？" || { msg_info "已取消"; return; }
-            fi
-
-            # 检查磁盘空间
-            local avail_kb
-            avail_kb=$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
-            if [[ -n "$avail_kb" ]] && [[ "$avail_kb" -lt $((new_size_mb * 1024)) ]]; then
-                msg_err "磁盘空间不足！可用: $((avail_kb / 1024)) MB，需要: ${new_size_mb} MB"
-                return
-            fi
-
-            echo ""
-            msg_bold "阶段一：删除所有现有 Swap"
-            echo ""
-
-            # 关闭所有 swap
-            if [[ ${#old_devices[@]} -gt 0 ]]; then
-                if swapoff -a 2>/dev/null; then
-                    msg_ok "已关闭所有 Swap"
-                else
-                    msg_err "swapoff 失败，请检查是否有进程占用"
-                    return
-                fi
-
-                # 删除旧 swap 文件
-                for dev in "${old_devices[@]}"; do
-                    if [[ -f "$dev" ]]; then
-                        rm -f "$dev"
-                        msg_info "已删除: $dev"
-                    fi
-                done
-            fi
-
-            # 清理 fstab 中所有 swap 条目
-            backup_file /etc/fstab
-            if grep -qE '^\s*(/swapfile|/swap[^[:space:]]*)\s+none\s+swap' /etc/fstab 2>/dev/null; then
-                sed -i '\|\s\+none\s\+swap\s|d' /etc/fstab
-                msg_info "已从 /etc/fstab 清理所有 Swap 条目"
-            fi
-
-            echo ""
-            msg_bold "阶段二：创建新 Swap 文件"
-
-            # 如果目标文件已存在但不在旧列表中，先删除
-            if [[ -f "$DEFAULT_SWAPFILE" ]]; then
-                msg_warn "$DEFAULT_SWAPFILE 已存在，将被覆盖"
-                rm -f "$DEFAULT_SWAPFILE"
-            fi
-
-            msg_info "正在创建: $DEFAULT_SWAPFILE (${new_size_mb} MB)..."
-            echo ""
-
-            if dd if=/dev/zero of="$DEFAULT_SWAPFILE" bs=1M count="$new_size_mb" status=progress 2>/dev/null; then
-                msg_ok "Swap 文件已创建"
-            else
-                msg_err "创建 Swap 文件失败"
-                return
-            fi
-
-            chmod 600 "$DEFAULT_SWAPFILE"
-
-            if mkswap "$DEFAULT_SWAPFILE" >/dev/null 2>&1; then
-                msg_ok "mkswap 完成"
-            else
-                msg_err "mkswap 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            if swapon "$DEFAULT_SWAPFILE" 2>/dev/null; then
-                msg_ok "swapon 完成，Swap 已启用"
-            else
-                msg_err "swapon 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            # 写入 fstab
-            echo "${DEFAULT_SWAPFILE} none swap sw 0 0" >> /etc/fstab
-            msg_info "已添加 Swap 条目到 /etc/fstab"
-
-            echo ""
-            msg_bold "调整后 Swap 状态:"
-            swapon --show 2>/dev/null
-            msg_ok "Swap 调整完成 ✓"
-            ;;
-
-        0)
-            msg_info "已取消"
-            ;;
-        *)
-            msg_err "无效选项"
-            ;;
-    esac
-
-    echo ""
-    msg_ok "功能 7 执行完毕。"
-}
-
-# ─── 主菜单 ───
-
-print_banner() {
-    clear 2>/dev/null || true
-    echo -e "${C_BOLD}${C_BLUE}"
-    echo "╔══════════════════════════════════════════╗"
-    echo "║       Linux 系统配置助手                 ║"
-    echo "╠══════════════════════════════════════════╣"
-    echo -e "║  检测系统: $(get_os_name)  ║"
-    echo "╚══════════════════════════════════════════╝"
-    echo -e "${C_RESET}"
-}
-
-main_menu() {
-    # curl|bash 管道执行时 stdin 是管道，此时 bash 已读完脚本
-    # 将 stdin 重定向到 /dev/tty 以恢复交互式 read
-    if [[ ! -t 0 ]]; then
-        { exec < /dev/tty; } 2>/dev/null || true
+        msg_warn "默认 qdisc: $qdisc_val (未启用 fq)"
     fi
 
-    while true; do
-        print_banner
-        echo "  1. 开启 BBR + fq + ECN + bpftune"
-        echo "  2. 开启时间同步 (NTP)"
-        echo "  3. 修改 SSH 端口"
-        echo "  4. 开启 root 密码登录"
-        echo "  5. 删除 SSH 密钥，仅用密码登录"
-        echo "  6. 开启/禁用 IPv6"
-        echo "  7. 配置 Swap"
-        echo "  0. 退出"
-        echo ""
-        local choice
-        echo -ne "${C_BOLD}请输入选项 [0-7]: ${C_RESET}"
-        read -r choice
-        echo ""
+    local ecn_val
+    ecn_val=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
+    if [[ "$ecn_val" == "1" ]]; then
+        msg_ok "TCP ECN: 已启用"
+    else
+        msg_warn "TCP ECN: $ecn_val (未启用)"
+    fi
 
-        case "$choice" in
-            1) func_enable_bbr || msg_err "操作失败" ;;
-            2) func_enable_ntp || msg_err "操作失败" ;;
-            3) func_change_ssh_port || msg_err "操作失败" ;;
-            4) func_enable_root_login || msg_err "操作失败" ;;
-            5) func_remove_keys || msg_err "操作失败" ;;
-            6) func_toggle_ipv6 || msg_err "操作失败" ;;
-            7) func_configure_swap || msg_err "操作失败" ;;
-            0) msg_info "再见！"; exit 0 ;;
-            *) msg_err "无效选项，请重试" ;&
+    if lsmod 2>/dev/null | grep -q 'tcp_bbr'; then
+        msg_ok "BBR 模块: 已加载"
+    else
+        msg_warn "BBR 模块: 未加载"
+    fi
+
+    # ── bpftune ──
+    echo ""
+    echo -e "${C_BOLD}── bpftune ──${C_RESET}"
+    if command -v bpftune &>/dev/null; then
+        msg_ok "bpftune: 已安装 ($(command -v bpftune))"
+        if systemctl is-active --quiet bpftune 2>/dev/null; then
+            msg_ok "bpftune 服务: 运行中"
+        else
+            msg_warn "bpftune 服务: 未运行"
+        fi
+    else
+        msg_warn "bpftune: 未安装"
+    fi
+
+    # ── NTP ──
+    echo ""
+    echo -e "${C_BOLD}── 时间同步 ──${C_RESET}"
+    local ntp_active
+    ntp_active=$(timedatectl show -p NTP --value 2>/dev/null || echo "unknown")
+    if [[ "$ntp_active" == "yes" ]]; then
+        msg_ok "NTP 时间同步: 已启用"
+    else
+        msg_warn "NTP 时间同步: $ntp_active"
+    fi
+    local ntp_svc
+    ntp_svc=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "unknown")
+    if [[ "$ntp_svc" == "yes" ]]; then
+        msg_ok "NTP 同步状态: 已同步"
+    else
+        msg_warn "NTP 同步状态: $ntp_svc"
+    fi
+
+    # ── SSH ──
+    echo ""
+    echo -e "${C_BOLD}── SSH 配置 ──${C_RESET}"
+
+    if command -v sshd &>/dev/null; then
+        local ssh_port
+        ssh_port=$(sshd -T 2>/dev/null | grep -E '^port ' | awk '{print $2}' || echo "unknown")
+        msg_info "SSH 端口: $ssh_port"
+
+        local prl
+        prl=$(sshd -T 2>/dev/null | grep -E '^permitrootlogin ' | awk '{print $2}' || echo "unknown")
+        case "$prl" in
+            yes) msg_ok "PermitRootLogin: yes" ;;
+            no|prohibit-password|forced-commands-only) msg_warn "PermitRootLogin: $prl" ;;
+            *) msg_info "PermitRootLogin: $prl" ;;
         esac
 
-        if [[ "$choice" =~ ^[1-7]$ ]]; then
-            echo ""
-            echo -ne "${C_BOLD}按 Enter 返回菜单...${C_RESET}"
-            read -r
+        local pa
+        pa=$(sshd -T 2>/dev/null | grep -E '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
+        if [[ "$pa" == "yes" ]]; then
+            msg_ok "PasswordAuthentication: yes"
+        else
+            msg_warn "PasswordAuthentication: $pa"
         fi
-    done
-}
 
-main() {
-    check_root
-    check_os || exit 1
-    main_menu
-}
+        local am
+        am=$(sshd -T 2>/dev/null | grep -E '^authenticationmethods ' | awk '{$1=""; print $0}' | xargs || echo "(未设置)")
+        if [[ -n "$am" && "$am" != "(未设置)" ]]; then
+            msg_warn "AuthenticationMethods: $am"
+        else
+            msg_ok "AuthenticationMethods: 无限制"
+        fi
+    else
+        msg_warn "sshd 未安装或无法访问"
+    fi
 
-# 如果非 source（直接执行或 curl|bash 管道），则启动 main
-# return 0 仅在 source 时成功 → 管道/直接执行都走 || 分支
-(return 0 2>/dev/null) || main "$@"
+    # ── root 密码 ──
+    echo ""
+    echo -e "${C_BOLD}── root 账户 ──${C_RESET}"
+    local passwd_status
+    passwd_status=$(passwd -S root 2>/dev/null || echo "unknown")
+    msg_info "root 密码: $passwd_status"
+    case "$(echo "$passwd_status" | awk '{print $2}')" in
+        P) msg_ok "root 密码: 已设置" ;;
+        L) msg_warn "root 密码: 已锁定" ;;
+        NP) msg_warn "root 密码: 未设置" ;;
+    esac
+
+    # ── authorized_keys ──
+    if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
+        local ak_count
+        ak_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "0")
+        msg_warn "root authorized_keys: ${ak_count} 个密钥"
+    else
+        msg_ok "root authorized_keys: 空或不存在"
+    fi
+
+    # ── sshd_config.d drop-in ──
+    echo ""
+    echo -e "${C_BOLD}── drop-in 配置文件 ${SSHD_CONFIG_D} ──${C_RESET}"
+    if [[ -d "$SSHD_CONFIG_D" ]]; then
+        local dropins
+        dropins=$(find "$SSHD_CONFIG_D" -name '*.conf' -type f 2>/dev/null | wc -l)
+        if [[ "$dropins" -gt 0 ]]; then
+            msg_info "共 ${dropins} 个 .conf 文件:"
+            find "$SSHD_CONFIG_D" -name '*.conf' -type f 2>/dev/null | while IFS= read -r f; do
+                echo "    $(basename "$f")"
+                grep -E '^(PermitRootLogin|PasswordAuthentication|AuthenticationMethods|Port)' "$f" 2>/dev/null | while IFS= read -r line; do
+                    echo "      $line"
+                done
+            done
+        else
+            msg_ok "无 drop-in 配置文件"
+        fi
+    else
+        msg_info "目录不存在"
+    fi
+
+    echo ""
+    msg_ok "状态查看完毕。"
+}
+```
+
+- [ ] **Step 2: 语法检查**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 无错误。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "feat: 添加功能6 — 查看当前系统状态"
+```
+
+---
+
+### Task 8: 最终集成验证与修正
+
+**Files:**
+- Modify: `sysctl-helper.sh` — 确保所有函数顺序正确、`main_menu` 能正确调用
+
+- [ ] **Step 1: 确保函数定义顺序正确**
+
+函数必须在调用前定义。验证顺序:
+
+```bash
+# 应输出函数定义顺序:
+grep -n '^func_\|^main_menu\|^main\|^check_root\|^check_os\|^detect_sshd\|^msg_\|^confirm\|^backup' /root/github/linux/sysctl-helper.sh
+```
+
+Expected: 工具函数 → 功能函数 (1-6) → main_menu → main → 执行入口
+
+- [ ] **Step 2: 检查所有 `main_menu` case 分支函数名正确**
+
+```bash
+grep -A1 'case.*choice' /root/github/linux/sysctl-helper.sh | grep 'func_'
+```
+
+Expected 显示:
+```
+1) func_enable_bbr ;;
+2) func_enable_ntp ;;
+3) func_change_ssh_port ;;
+4) func_enable_root_login ;;
+5) func_remove_keys ;;
+6) func_show_status ;;
+```
+
+- [ ] **Step 3: 完整语法检查 + shellcheck**
+
+```bash
+bash -n /root/github/linux/sysctl-helper.sh
+# Expected: 无输出
+
+# 如果有 shellcheck
+command -v shellcheck &>/dev/null && shellcheck -x sysctl-helper.sh || echo "shellcheck 未安装，跳过"
+# Expected: 无严重错误 (SC1091 source 外部文件可忽略)
+```
+
+- [ ] **Step 4: 验证脚本权限和可执行性**
+
+```bash
+ls -la /root/github/linux/sysctl-helper.sh
+# 添加 shebang 确认
+head -1 /root/github/linux/sysctl-helper.sh
+# Expected: #!/bin/bash
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git -C /root/github/linux add sysctl-helper.sh
+git -C /root/github/linux commit -m "chore: 最终集成验证，确保函数顺序和调用一致"
+# 如果无需修改则跳过此 commit
+```
+```
+
+---
+
+## 自审清单
+
+**1. Spec 覆盖率检查:**
+- ✅ BBR + fq + ECN + bpftune 四阶段 → Task 2
+- ✅ NTP 时间同步 → Task 3
+- ✅ 修改 SSH 端口 → Task 4
+- ✅ 开启 root 密码登录 → Task 5
+- ✅ 删除 SSH 密钥（含 DMIT 等厂商覆盖）→ Task 6
+- ✅ 查看当前状态 → Task 7
+- ✅ 交互式菜单 + root 检查 + OS 检查 → Task 1
+
+**2. 占位符扫描:** 无 TBD、TODO，无「适当添加错误处理」等模糊步骤。
+
+**3. 类型一致性:** 所有函数名统一: `func_enable_bbr`, `func_enable_ntp`, `func_change_ssh_port`, `func_enable_root_login`, `func_remove_keys`, `func_show_status`。工具函数统一: `msg_ok`, `msg_warn`, `msg_err`, `msg_info`, `confirm`, `backup_file`, `backup_dir`, `detect_sshd_service`。
+
+**4. 文件路径:** 全部使用 `/root/github/linux/sysctl-helper.sh`。
+
+---
+
+## 自审结果：通过 ✅

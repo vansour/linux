@@ -20,19 +20,21 @@ curl -sSL https://raw.githubusercontent.com/vansour/linux/main/sysctl-helper.sh 
 │  3. 修改 SSH 端口                   │
 │  4. 开启 root 密码登录              │
 │  5. 删除 SSH 密钥，仅用密码登录     │
-│  6. 查看当前状态                    │
+│  6. 开启/禁用 IPv6                  │
+│  7. 配置 Swap                       │
 │  0. 退出                            │
 └─────────────────────────────────────┘
 ```
 
 | # | 功能 | 说明 |
 |---|------|------|
-| 1 | BBR + fq + ECN + bpftune | 清空现有拥塞控制配置 → 写入 BBR/fq/ECN → 验证生效 → 安装 bpftune |
-| 2 | NTP 时间同步 | 自动检测 systemd-timesyncd/chrony，配置 pool.ntp.org |
-| 3 | 修改 SSH 端口 | 输入端口 → 备份配置 → 修改主配置+drop-in → 处理 ufw → 重启 sshd |
-| 4 | 开启 root 密码登录 | 修改 PermitRootLogin + PasswordAuthentication（含厂商 drop-in 目录） |
-| 5 | 仅用密码登录 | 强制前置 root 密码检查 → 扫描全部阻止因素（DMIT 等厂商覆盖）→ 清理密钥 |
-| 6 | 查看当前状态 | BBR/NTP/SSH/root 密码/authorized_keys/drop-in 全面状态 |
+| 1 | BBR + fq + ECN + bpftune | 展示当前状态 → 清空现有拥塞控制配置 → 写入 BBR/fq/ECN → 验证生效 → 安装 bpftune |
+| 2 | NTP 时间同步 | 展示当前同步状态 → 选择时区和 NTP 服务器 → 配置 systemd-timesyncd 或 chrony |
+| 3 | 修改 SSH 端口 | 展示当前端口 → 输入新端口 → 备份配置 → 修改主配置+drop-in → 处理 ufw → 重启 sshd |
+| 4 | 开启 root 密码登录 | 展示当前 PermitRootLogin/PasswordAuth/root 密码状态 → 修改配置（含厂商 drop-in 目录） |
+| 5 | 仅用密码登录 | 展示当前状态 → 强制前置 root 密码检查 → 扫描全部阻止因素 → 清理密钥 |
+| 6 | 开启/禁用 IPv6 | 展示当前 IPv6 状态 → 即时切换 + 持久化 sysctl 配置 + 可选 GRUB 内核参数 |
+| 7 | 配置 Swap | 展示当前 Swap 状态和内存 → 添加/删除/调整 swap 文件（默认 /swapfile），建议容量不超过内存 |
 
 ## 依赖要求
 
