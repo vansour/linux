@@ -1117,7 +1117,8 @@ main() {
     main_menu
 }
 
-# 如果直接执行（非 source），则启动
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# 如果直接执行（非 source）或通过 stdin 管道执行，则启动
+# ${BASH_SOURCE[0]} 在 curl | bash 管道场景下为空（unbound），需要 :- 兜底
+if [[ -z "${BASH_SOURCE[0]:-}" ]] || [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
     main "$@"
 fi
