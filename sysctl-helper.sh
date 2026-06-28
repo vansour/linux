@@ -240,7 +240,7 @@ func_enable_bbr_stage3_verify() {
 
     # 检查活跃连接中是否有 bbr
     local bbr_conns
-    bbr_conns=$(ss -ti 2>/dev/null | grep -c 'bbr' || echo "0")
+    bbr_conns=$(ss -ti 2>/dev/null | grep -c 'bbr' || true)
     if [[ "$bbr_conns" -gt 0 ]]; then
         msg_ok "检测到 $bbr_conns 个活跃连接使用 BBR"
     else
@@ -346,7 +346,6 @@ func_enable_ntp() {
 
     # 检测可用的 NTP 后端
     local use_timesyncd=0
-    local use_chrony=0
 
     if systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
         use_timesyncd=1
@@ -543,15 +542,6 @@ func_enable_root_login() {
     backup_file "$SSHD_CONFIG"
     backup_dir "$SSHD_CONFIG_D"
 
-    # 辅助函数：注释特定 key 在指定文件中的所有行
-    _comment_key() {
-        local file="$1" key="$2"
-        if [[ -f "$file" ]] && grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
-            sed -i "s|^\\(\\s*${key}\\s\\+\\)|# \\1|" "$file"
-            msg_info "已注释 $file 中的 $key"
-        fi
-    }
-
     # 辅助函数：设置 key value 在指定文件中
     _set_key() {
         local file="$1" key="$2" value="$3"
@@ -623,7 +613,11 @@ EOF
     # 4. 重启 sshd
     echo ""
     if sshd -t 2>/dev/null; then
-        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
+        msg_ok "sshd_config 语法检查通过"
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || {
+            msg_err "SSH 服务重启失败！请手动检查配置"
+            return
+        }
         msg_ok "$sshd_svc 服务已重启"
     else
         msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
@@ -654,7 +648,7 @@ func_remove_keys_scan() {
     # 1. 检查 authorized_keys
     if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
         local key_count
-        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "?")
+        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || true)
         SCAN_RESULTS+=("/root/.ssh/authorized_keys:${key_count} 个 SSH 公钥")
         msg_warn "发现: /root/.ssh/authorized_keys 中有 ${key_count} 个公钥"
     fi
@@ -666,7 +660,7 @@ func_remove_keys_scan() {
             local user
             user=$(basename "$home")
             local cnt
-            cnt=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$authkeys" 2>/dev/null || echo "?")
+            cnt=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$authkeys" 2>/dev/null || true)
             SCAN_RESULTS+=("${authkeys}:用户 $user 有 ${cnt} 个公钥 (仅报告，不操作)")
             msg_info "发现: ${authkeys} (用户 $user, ${cnt} 个密钥) — 仅报告"
         fi
@@ -694,8 +688,6 @@ func_remove_keys_scan() {
     if [[ -d "$SSHD_CONFIG_D" ]]; then
         while IFS= read -r -d '' f; do
             [[ ! -f "$f" ]] && continue
-            local name
-            name=$(basename "$f")
 
             if grep -qE '^\s*PasswordAuthentication\s+no' "$f" 2>/dev/null; then
                 SCAN_RESULTS+=("${f}:PasswordAuthentication no [vendor drop-in]")
@@ -821,7 +813,7 @@ func_remove_keys() {
     backup_file "$SSHD_CONFIG"
     backup_dir "$SSHD_CONFIG_D"
 
-    # 辅助函数（复用功能4的模式
+    # 辅助函数（复用功能4的模式）
     _set_or_comment() {
         local file="$1" key="$2" value="$3" action="$4"
         # action: "set" — 设为 value; "comment" — 注释掉该 key 的所有出现
@@ -891,7 +883,11 @@ EOF
     # 4. 重启 sshd
     echo ""
     if sshd -t 2>/dev/null; then
-        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
+        msg_ok "sshd_config 语法检查通过"
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null || {
+            msg_err "SSH 服务重启失败！请手动检查配置"
+            return
+        }
         msg_ok "$sshd_svc 服务已重启"
     else
         msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
@@ -1036,7 +1032,7 @@ func_show_status() {
     # ── authorized_keys ──
     if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
         local ak_count
-        ak_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "0")
+        ak_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || true)
         msg_warn "root authorized_keys: ${ak_count} 个密钥"
     else
         msg_ok "root authorized_keys: 空或不存在"
