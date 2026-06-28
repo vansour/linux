@@ -112,6 +112,227 @@ detect_sshd_service() {
     fi
 }
 
+# ─── 功能函数 ───
+
+# ─── 功能 1：开启 BBR + fq + ECN + bpftune ───
+
+# 返回 0=通过, 1=失败
+func_enable_bbr_stage1_clean() {
+    msg_bold "阶段一：清空现有拥塞控制配置"
+    echo ""
+
+    # 清空 /etc/sysctl.d/ 下的 BBR 相关文件
+    local cleaned=0
+    if [[ -f "$BBR_CONF" ]]; then
+        msg_info "删除现有配置文件: $BBR_CONF"
+        rm -f "$BBR_CONF"
+        cleaned=1
+    fi
+
+    # 扫描 sysctl.d 下所有 .conf，注释拥塞控制相关行
+    local files=()
+    [[ -f /etc/sysctl.conf ]] && files+=("/etc/sysctl.conf")
+    if [[ -d "$SYSTCLD_DIR" ]]; then
+        while IFS= read -r -d '' f; do
+            files+=("$f")
+        done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
+    fi
+
+    local targets=("net.core.default_qdisc" "net.ipv4.tcp_congestion_control" "net.ipv4.tcp_ecn")
+    for f in "${files[@]}"; do
+        [[ ! -f "$f" ]] && continue
+        backup_file "$f"
+        local modified=0
+        for key in "${targets[@]}"; do
+            if grep -qE "^\s*${key}\s*=" "$f" 2>/dev/null; then
+                sed -i "s|^\\(\\s*${key}\\s*=\\)|# \\1|" "$f"
+                msg_info "已注释 $f 中的 $key"
+                modified=1
+            fi
+        done
+        [[ $modified -eq 1 ]] && cleaned=1
+    done
+
+    # 重置当前内核参数
+    msg_info "将当前拥塞控制重置为系统默认..."
+    # 先尝试卸载可能已加载的非 BBR 模块并回退
+    local modules_to_unload=("tcp_westwood" "tcp_htcp" "tcp_cdg" "tcp_vegas" "tcp_yeah" "tcp_bic" "tcp_highspeed" "tcp_scalable")
+    for mod in "${modules_to_unload[@]}"; do
+        if lsmod | grep -q "^${mod} "; then
+            rmmod "$mod" 2>/dev/null || true
+            msg_info "已卸载模块: $mod"
+        fi
+    done
+
+    msg_ok "清空完成"
+    return 0
+}
+
+func_enable_bbr_stage2_apply() {
+    msg_bold "阶段二：写入新配置"
+    echo ""
+
+    # 检查内核版本
+    local kver
+    kver=$(uname -r | cut -d. -f1,2)
+    local major minor
+    major=$(echo "$kver" | cut -d. -f1)
+    minor=$(echo "$kver" | cut -d. -f2)
+    if [[ "$major" -lt 4 ]] || { [[ "$major" -eq 4 ]] && [[ "$minor" -lt 9 ]]; }; then
+        msg_err "内核版本 $(uname -r) < 4.9，不支持 BBR。请升级内核后重试。"
+        return 1
+    fi
+
+    # 加载 BBR 模块
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        msg_err "无法加载 tcp_bbr 模块。请确认内核已编译 BBR 支持 (CONFIG_TCP_CONG_BBR=m 或 y)"
+        return 1
+    fi
+    msg_ok "tcp_bbr 模块已加载"
+
+    # 写入配置文件
+    cat > "$BBR_CONF" <<'EOF'
+# BBR + fq + ECN — 由 sysctl-helper 配置
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_ecn = 1
+EOF
+    msg_info "已写入 $BBR_CONF"
+
+    # 即时生效
+    sysctl -p "$BBR_CONF" >/dev/null 2>&1
+    msg_ok "配置已即时生效"
+    return 0
+}
+
+func_enable_bbr_stage3_verify() {
+    msg_bold "阶段三：验证配置生效"
+    echo ""
+
+    local all_ok=1
+
+    local cc_val
+    cc_val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$cc_val" == "bbr" ]]; then
+        msg_ok "拥塞控制算法: bbr"
+    else
+        msg_err "拥塞控制算法: $cc_val (预期: bbr)"
+        all_ok=0
+    fi
+
+    local qdisc_val
+    qdisc_val=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    if [[ "$qdisc_val" == "fq" ]]; then
+        msg_ok "默认 qdisc: fq"
+    else
+        msg_err "默认 qdisc: $qdisc_val (预期: fq)"
+        all_ok=0
+    fi
+
+    local ecn_val
+    ecn_val=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
+    if [[ "$ecn_val" == "1" ]]; then
+        msg_ok "TCP ECN: 1 (已启用)"
+    else
+        msg_err "TCP ECN: $ecn_val (预期: 1)"
+        all_ok=0
+    fi
+
+    # 检查活跃连接中是否有 bbr
+    local bbr_conns
+    bbr_conns=$(ss -ti 2>/dev/null | grep -c 'bbr' || echo "0")
+    if [[ "$bbr_conns" -gt 0 ]]; then
+        msg_ok "检测到 $bbr_conns 个活跃连接使用 BBR"
+    else
+        msg_info "未检测到活跃 BBR 连接（可能无对外连接，新连接将使用 BBR）"
+    fi
+
+    if [[ $all_ok -eq 1 ]]; then
+        msg_ok "全部验证通过 ✓"
+    else
+        msg_warn "部分验证未通过，请检查上方输出"
+    fi
+    return $all_ok
+}
+
+func_enable_bbr_stage4_bpftune() {
+    msg_bold "阶段四：安装 bpftune"
+    echo ""
+
+    # 检查是否已安装
+    if command -v bpftune &>/dev/null; then
+        msg_ok "bpftune 已安装: $(command -v bpftune)"
+    else
+        msg_info "正在安装 bpftune..."
+        if apt update -qq 2>/dev/null && apt install -y bpftune 2>/dev/null; then
+            msg_ok "bpftune 通过 apt 安装成功"
+        else
+            msg_info "apt 不可用或未收录，尝试从 GitHub Releases 下载..."
+            local latest_deb
+            latest_deb=$(curl -s "https://api.github.com/repos/oracle-samples/bpftune/releases/latest" 2>/dev/null \
+                | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb' | head -1)
+            if [[ -n "$latest_deb" ]]; then
+                local tmp_deb="/tmp/bpftune_latest.deb"
+                msg_info "下载: $latest_deb"
+                if curl -sL -o "$tmp_deb" "$latest_deb"; then
+                    dpkg -i "$tmp_deb" && apt install -f -y 2>/dev/null
+                    rm -f "$tmp_deb"
+                    msg_ok "bpftune .deb 安装完成"
+                else
+                    msg_err "下载失败"
+                    msg_warn "请手动安装: https://github.com/oracle-samples/bpftune/releases"
+                    return 1
+                fi
+            else
+                msg_err "未找到 bpftune release 的 .deb 文件"
+                msg_warn "请手动安装: https://github.com/oracle-samples/bpftune/releases"
+                return 1
+            fi
+        fi
+    fi
+
+    # 启用并启动服务
+    if systemctl enable --now bpftune 2>/dev/null; then
+        msg_ok "bpftune 服务已启用并启动"
+    else
+        msg_warn "bpftune 服务启用失败，尝试手动启动..."
+        systemctl start bpftune 2>/dev/null || msg_err "无法启动 bpftune 服务"
+    fi
+
+    # 验证
+    if systemctl is-active --quiet bpftune 2>/dev/null; then
+        msg_ok "bpftune 运行中 ✓"
+    else
+        msg_warn "bpftune 未在运行，请检查 systemctl status bpftune"
+    fi
+}
+
+func_enable_bbr() {
+    echo ""
+    msg_bold "══════════ 功能 1：开启 BBR + fq + ECN + bpftune ══════════"
+    echo ""
+
+    msg_info "此操作将:"
+    echo "  1. 清空所有现有拥塞控制配置"
+    echo "  2. 写入 BBR + fq + ECN 配置"
+    echo "  3. 验证配置生效"
+    echo "  4. 安装并启用 bpftune"
+    echo ""
+
+    confirm "是否继续？" || { msg_info "已取消"; return; }
+
+    func_enable_bbr_stage1_clean || { msg_err "阶段一失败"; return; }
+    echo ""
+    func_enable_bbr_stage2_apply || { msg_err "阶段二失败"; return; }
+    echo ""
+    func_enable_bbr_stage3_verify || { msg_warn "阶段三有警告"; }
+    echo ""
+    func_enable_bbr_stage4_bpftune || { msg_warn "阶段四有警告"; }
+
+    echo ""
+    msg_ok "功能 1 执行完毕。"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
