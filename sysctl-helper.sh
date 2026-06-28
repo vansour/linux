@@ -914,6 +914,159 @@ EOF
     msg_warn "⚠  测试通过前请勿关闭当前会话！"
 }
 
+# ─── 功能 6：查看当前状态 ───
+
+func_show_status() {
+    echo ""
+    msg_bold "══════════ 功能 6：查看当前状态 ══════════"
+    echo ""
+
+    # ── BBR / 拥塞控制 ──
+    echo -e "${C_BOLD}── 拥塞控制 ──${C_RESET}"
+    local cc_val
+    cc_val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$cc_val" == "bbr" ]]; then
+        msg_ok "拥塞控制算法: $cc_val"
+    else
+        msg_warn "拥塞控制算法: $cc_val (未启用 BBR)"
+    fi
+
+    local qdisc_val
+    qdisc_val=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    if [[ "$qdisc_val" == "fq" ]]; then
+        msg_ok "默认 qdisc: $qdisc_val"
+    else
+        msg_warn "默认 qdisc: $qdisc_val (未启用 fq)"
+    fi
+
+    local ecn_val
+    ecn_val=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
+    if [[ "$ecn_val" == "1" ]]; then
+        msg_ok "TCP ECN: 已启用"
+    else
+        msg_warn "TCP ECN: $ecn_val (未启用)"
+    fi
+
+    if lsmod 2>/dev/null | grep -q 'tcp_bbr'; then
+        msg_ok "BBR 模块: 已加载"
+    else
+        msg_warn "BBR 模块: 未加载"
+    fi
+
+    # ── bpftune ──
+    echo ""
+    echo -e "${C_BOLD}── bpftune ──${C_RESET}"
+    if command -v bpftune &>/dev/null; then
+        msg_ok "bpftune: 已安装 ($(command -v bpftune))"
+        if systemctl is-active --quiet bpftune 2>/dev/null; then
+            msg_ok "bpftune 服务: 运行中"
+        else
+            msg_warn "bpftune 服务: 未运行"
+        fi
+    else
+        msg_warn "bpftune: 未安装"
+    fi
+
+    # ── NTP ──
+    echo ""
+    echo -e "${C_BOLD}── 时间同步 ──${C_RESET}"
+    local ntp_active
+    ntp_active=$(timedatectl show -p NTP --value 2>/dev/null || echo "unknown")
+    if [[ "$ntp_active" == "yes" ]]; then
+        msg_ok "NTP 时间同步: 已启用"
+    else
+        msg_warn "NTP 时间同步: $ntp_active"
+    fi
+    local ntp_svc
+    ntp_svc=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "unknown")
+    if [[ "$ntp_svc" == "yes" ]]; then
+        msg_ok "NTP 同步状态: 已同步"
+    else
+        msg_warn "NTP 同步状态: $ntp_svc"
+    fi
+
+    # ── SSH ──
+    echo ""
+    echo -e "${C_BOLD}── SSH 配置 ──${C_RESET}"
+
+    if command -v sshd &>/dev/null; then
+        local ssh_port
+        ssh_port=$(sshd -T 2>/dev/null | grep -E '^port ' | awk '{print $2}' || echo "unknown")
+        msg_info "SSH 端口: $ssh_port"
+
+        local prl
+        prl=$(sshd -T 2>/dev/null | grep -E '^permitrootlogin ' | awk '{print $2}' || echo "unknown")
+        case "$prl" in
+            yes) msg_ok "PermitRootLogin: yes" ;;
+            no|prohibit-password|forced-commands-only) msg_warn "PermitRootLogin: $prl" ;;
+            *) msg_info "PermitRootLogin: $prl" ;;
+        esac
+
+        local pa
+        pa=$(sshd -T 2>/dev/null | grep -E '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
+        if [[ "$pa" == "yes" ]]; then
+            msg_ok "PasswordAuthentication: yes"
+        else
+            msg_warn "PasswordAuthentication: $pa"
+        fi
+
+        local am
+        am=$(sshd -T 2>/dev/null | grep -E '^authenticationmethods ' | awk '{$1=""; print $0}' | xargs || echo "(未设置)")
+        if [[ -n "$am" && "$am" != "(未设置)" ]]; then
+            msg_warn "AuthenticationMethods: $am"
+        else
+            msg_ok "AuthenticationMethods: 无限制"
+        fi
+    else
+        msg_warn "sshd 未安装或无法访问"
+    fi
+
+    # ── root 密码 ──
+    echo ""
+    echo -e "${C_BOLD}── root 账户 ──${C_RESET}"
+    local passwd_status
+    passwd_status=$(passwd -S root 2>/dev/null || echo "unknown")
+    msg_info "root 密码: $passwd_status"
+    case "$(echo "$passwd_status" | awk '{print $2}')" in
+        P) msg_ok "root 密码: 已设置" ;;
+        L) msg_warn "root 密码: 已锁定" ;;
+        NP) msg_warn "root 密码: 未设置" ;;
+    esac
+
+    # ── authorized_keys ──
+    if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
+        local ak_count
+        ak_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "0")
+        msg_warn "root authorized_keys: ${ak_count} 个密钥"
+    else
+        msg_ok "root authorized_keys: 空或不存在"
+    fi
+
+    # ── sshd_config.d drop-in ──
+    echo ""
+    echo -e "${C_BOLD}── drop-in 配置文件 ${SSHD_CONFIG_D} ──${C_RESET}"
+    if [[ -d "$SSHD_CONFIG_D" ]]; then
+        local dropins
+        dropins=$(find "$SSHD_CONFIG_D" -name '*.conf' -type f 2>/dev/null | wc -l)
+        if [[ "$dropins" -gt 0 ]]; then
+            msg_info "共 ${dropins} 个 .conf 文件:"
+            find "$SSHD_CONFIG_D" -name '*.conf' -type f 2>/dev/null | while IFS= read -r f; do
+                echo "    $(basename "$f")"
+                grep -E '^(PermitRootLogin|PasswordAuthentication|AuthenticationMethods|Port)' "$f" 2>/dev/null | while IFS= read -r line; do
+                    echo "      $line"
+                done
+            done
+        else
+            msg_ok "无 drop-in 配置文件"
+        fi
+    else
+        msg_info "目录不存在"
+    fi
+
+    echo ""
+    msg_ok "状态查看完毕。"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
