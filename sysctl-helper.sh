@@ -5,13 +5,6 @@
 
 set -euo pipefail
 
-# curl | bash 管道执行时 stdin 被管道占用，read 会立即读到 EOF 导致退出
-# 检测到 stdin 非终端时，尝试重定向到 /dev/tty 恢复交互输入
-# 无控制终端环境下（CI/cron/后台）静默跳过
-if [[ ! -t 0 ]]; then
-    { exec < /dev/tty; } 2>/dev/null || true
-fi
-
 # ─── 颜色常量 ───
 if [[ -t 1 ]]; then
     C_RESET='\033[0m'
@@ -1084,6 +1077,12 @@ print_banner() {
 }
 
 main_menu() {
+    # curl|bash 管道执行时 stdin 是管道，此时 bash 已读完脚本
+    # 将 stdin 重定向到 /dev/tty 以恢复交互式 read
+    if [[ ! -t 0 ]]; then
+        { exec < /dev/tty; } 2>/dev/null || true
+    fi
+
     while true; do
         print_banner
         echo "  1. 开启 BBR + fq + ECN + bpftune"
