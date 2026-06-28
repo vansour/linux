@@ -641,6 +641,279 @@ EOF
     msg_info "请测试: ssh root@<ip> 确认密码登录可用。"
 }
 
+# ─── 功能 5：删除 SSH 密钥，仅用密码登录 ───
+
+func_remove_keys_scan() {
+    # 返回: 在全局变量 SCAN_RESULTS 数组中写入"阻止密码登录的因素"
+    # 每个元素格式: "file:line:issue"
+    SCAN_RESULTS=()
+
+    msg_info "正在扫描阻止密码登录的因素..."
+    echo ""
+
+    # 1. 检查 authorized_keys
+    if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
+        local key_count
+        key_count=$(grep -cE '^(ssh-|ecdsa-|sk-)' /root/.ssh/authorized_keys 2>/dev/null || echo "?")
+        SCAN_RESULTS+=("/root/.ssh/authorized_keys:${key_count} 个 SSH 公钥")
+        msg_warn "发现: /root/.ssh/authorized_keys 中有 ${key_count} 个公钥"
+    fi
+
+    # 2. 检查其他用户
+    for home in /home/*; do
+        local authkeys="${home}/.ssh/authorized_keys"
+        if [[ -f "$authkeys" ]] && [[ -s "$authkeys" ]]; then
+            local user
+            user=$(basename "$home")
+            local cnt
+            cnt=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$authkeys" 2>/dev/null || echo "?")
+            SCAN_RESULTS+=("${authkeys}:用户 $user 有 ${cnt} 个公钥 (仅报告，不操作)")
+            msg_info "发现: ${authkeys} (用户 $user, ${cnt} 个密钥) — 仅报告"
+        fi
+    done
+
+    # 3. 检查 sshd 主配置
+    if grep -qE '^\s*PasswordAuthentication\s+no' "$SSHD_CONFIG" 2>/dev/null; then
+        SCAN_RESULTS+=("$SSHD_CONFIG:PasswordAuthentication no")
+        msg_warn "发现: $SSHD_CONFIG — PasswordAuthentication no"
+    fi
+    if grep -qE '^\s*AuthenticationMethods\s+' "$SSHD_CONFIG" 2>/dev/null; then
+        local auth_method
+        auth_method=$(grep -E '^\s*AuthenticationMethods\s+' "$SSHD_CONFIG" 2>/dev/null | head -1)
+        SCAN_RESULTS+=("$SSHD_CONFIG:${auth_method}")
+        msg_warn "发现: $SSHD_CONFIG — AuthenticationMethods 限制"
+    fi
+    if grep -qE '^\s*PermitRootLogin\s+(no|prohibit-password|forced-commands-only)' "$SSHD_CONFIG" 2>/dev/null; then
+        local prl
+        prl=$(grep -E '^\s*PermitRootLogin\s+(no|prohibit-password|forced-commands-only)' "$SSHD_CONFIG" 2>/dev/null | head -1)
+        SCAN_RESULTS+=("$SSHD_CONFIG:${prl}")
+        msg_warn "发现: $SSHD_CONFIG — PermitRootLogin 限制"
+    fi
+
+    # 4. 检查 drop-in 目录 — 关键：DMIT 等厂商用此
+    if [[ -d "$SSHD_CONFIG_D" ]]; then
+        while IFS= read -r -d '' f; do
+            [[ ! -f "$f" ]] && continue
+            local name
+            name=$(basename "$f")
+
+            if grep -qE '^\s*PasswordAuthentication\s+no' "$f" 2>/dev/null; then
+                SCAN_RESULTS+=("${f}:PasswordAuthentication no [vendor drop-in]")
+                msg_warn "发现: $f — PasswordAuthentication no (厂商覆盖!)"
+            fi
+            if grep -qE '^\s*AuthenticationMethods\s+' "$f" 2>/dev/null; then
+                local am
+                am=$(grep -E '^\s*AuthenticationMethods\s+' "$f" 2>/dev/null | head -1)
+                SCAN_RESULTS+=("${f}:${am} [vendor drop-in]")
+                msg_warn "发现: $f — AuthenticationMethods 限制 (厂商覆盖!)"
+            fi
+            if grep -qE '^\s*PermitRootLogin\s+(no|prohibit-password|forced-commands-only)' "$f" 2>/dev/null; then
+                local prl2
+                prl2=$(grep -E '^\s*PermitRootLogin\s+(no|prohibit-password|forced-commands-only)' "$f" 2>/dev/null | head -1)
+                SCAN_RESULTS+=("${f}:${prl2} [vendor drop-in]")
+                msg_warn "发现: $f — PermitRootLogin 限制 (厂商覆盖!)"
+            fi
+        done < <(find "$SSHD_CONFIG_D" -name '*.conf' -type f -print0 2>/dev/null || true)
+    fi
+
+    # 5. 检查 Match 块
+    for conf_file in "$SSHD_CONFIG" "$SSHD_CONFIG_D"/*.conf; do
+        [[ ! -f "$conf_file" ]] && continue
+        if grep -q 'Match' "$conf_file" 2>/dev/null; then
+            msg_info "注意: $conf_file 存在 Match 块，请人工确认其中无认证限制"
+            SCAN_RESULTS+=("${conf_file}:存在 Match 块，请人工确认")
+        fi
+    done
+
+    # 6. 检查 PAM
+    if [[ -f /etc/pam.d/sshd ]]; then
+        if grep -qE '^auth\s+.*pam_listfile' /etc/pam.d/sshd 2>/dev/null; then
+            SCAN_RESULTS+=("/etc/pam.d/sshd:pam_listfile 限制")
+            msg_warn "发现: /etc/pam.d/sshd — pam_listfile 可能限制用户"
+        fi
+    fi
+
+    # 7. root 账户锁定状态
+    local ps
+    ps=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "?")
+    if [[ "$ps" != "P" ]]; then
+        SCAN_RESULTS+=("root:密码状态=$ps (非正常状态)")
+        msg_warn "发现: root 密码状态异常 ($ps)"
+    fi
+}
+
+func_remove_keys() {
+    echo ""
+    msg_bold "══════════ 功能 5：删除 SSH 密钥，仅用密码登录 ══════════"
+    echo ""
+
+    local sshd_svc
+    sshd_svc=$(detect_sshd_service)
+    msg_info "SSH 服务: $sshd_svc"
+
+    echo ""
+    msg_warn "⚠  此操作将删除所有 SSH 密钥，仅允许密码登录。"
+    msg_warn "⚠  请确保你已设置 root 密码。"
+    msg_warn "⚠  当前 SSH 连接不会断开，但请保留备用终端。"
+    echo ""
+
+    # ─── 前置检查：强制 root 密码已设置 ───
+    local passwd_status
+    passwd_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "?")
+    msg_info "root 密码状态: $passwd_status"
+
+    case "$passwd_status" in
+        P)
+            msg_ok "root 密码已设置，继续..."
+            ;;
+        L)
+            msg_err "root 账户已锁定！请先执行功能 4 或手动解锁: passwd -u root"
+            msg_info "解锁后请运行 passwd root 设置密码。"
+            return
+            ;;
+        NP|*)
+            msg_err "root 密码未设置！请先设置密码后再执行此操作。"
+            msg_info "设置方法: passwd root"
+            echo ""
+            echo -ne "${C_BOLD}要现在设置 root 密码吗？(y/N): ${C_RESET}"
+            local ans
+            read -r ans
+            if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
+                passwd root
+                # 重新检查
+                passwd_status=$(passwd -S root 2>/dev/null | awk '{print $2}' || echo "?")
+                if [[ "$passwd_status" != "P" ]]; then
+                    msg_err "密码设置未成功 (状态: $passwd_status)，操作取消。"
+                    return
+                fi
+            else
+                msg_info "已取消。请先设置 root 密码。"
+                return
+            fi
+            ;;
+    esac
+
+    echo ""
+
+    # ─── 扫描阶段 ───
+    func_remove_keys_scan
+
+    # ─── 展示清单 ───
+    echo ""
+    msg_bold "══════════ 扫描结果清单 ══════════"
+    if [[ ${#SCAN_RESULTS[@]} -eq 0 ]]; then
+        msg_ok "未发现阻止密码登录的因素。"
+    else
+        local i=1
+        for item in "${SCAN_RESULTS[@]}"; do
+            echo "  ${i}. ${item}"
+            ((i++))
+        done
+    fi
+    echo ""
+
+    confirm "确认执行清理？(将删除密钥并修正上述所有配置)" || { msg_info "已取消"; return; }
+
+    # ─── 清理阶段 ───
+    echo ""
+    msg_bold "执行清理..."
+
+    backup_file "$SSHD_CONFIG"
+    backup_dir "$SSHD_CONFIG_D"
+
+    # 辅助函数（复用功能4的模式
+    _set_or_comment() {
+        local file="$1" key="$2" value="$3" action="$4"
+        # action: "set" — 设为 value; "comment" — 注释掉该 key 的所有出现
+        if [[ ! -f "$file" ]]; then
+            return
+        fi
+        case "$action" in
+            set)
+                if grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
+                    sed -i "s|^\\s*${key}\\s\\+.*|${key} ${value}|" "$file"
+                elif grep -qE "^\s*#\s*${key}\s+" "$file" 2>/dev/null; then
+                    sed -i "s|^#\\s*${key}\\s\\+.*|${key} ${value}|" "$file"
+                else
+                    echo "${key} ${value}" >> "$file"
+                fi
+                msg_info "  $file: ${key} ${value}"
+                ;;
+            comment)
+                if grep -qE "^\s*${key}\s+" "$file" 2>/dev/null; then
+                    sed -i "s|^\\(\\s*${key}\\s\\+\\)|# \\1|" "$file"
+                    msg_info "  $file: 已注释 $key"
+                fi
+                ;;
+        esac
+    }
+
+    # 1. 主配置
+    _set_or_comment "$SSHD_CONFIG" "PasswordAuthentication" "yes" "set"
+    _set_or_comment "$SSHD_CONFIG" "PermitRootLogin" "yes" "set"
+    _set_or_comment "$SSHD_CONFIG" "AuthenticationMethods" "" "comment"
+    # 也注释 KbdInteractiveAuthentication no 如果有
+    sed -i 's/^\(\s*KbdInteractiveAuthentication\s\+no\)/# \1/' "$SSHD_CONFIG" 2>/dev/null || true
+
+    # 2. drop-in 目录
+    if [[ -d "$SSHD_CONFIG_D" ]]; then
+        while IFS= read -r -d '' f; do
+            [[ ! -f "$f" ]] && continue
+            sed -i 's/^\(\s*PermitRootLogin\s\+prohibit-password\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PermitRootLogin\s\+no\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PermitRootLogin\s\+forced-commands-only\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*PasswordAuthentication\s\+no\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*AuthenticationMethods\s\+\)/# \1/' "$f" 2>/dev/null || true
+            sed -i 's/^\(\s*KbdInteractiveAuthentication\s\+no\)/# \1/' "$f" 2>/dev/null || true
+            msg_info "  已处理 drop-in: $f"
+        done < <(find "$SSHD_CONFIG_D" -name '*.conf' -type f -print0 2>/dev/null || true)
+
+        # 写高优先级覆盖配置
+        local override="${SSHD_CONFIG_D}/99-sysctl-helper-password-only.conf"
+        cat > "$override" <<'EOF'
+# 仅密码登录 — 由 sysctl-helper 设置
+PermitRootLogin yes
+PasswordAuthentication yes
+# AuthenticationMethods 已清除
+EOF
+        msg_info "  已写入覆盖配置: $override"
+    fi
+
+    # 3. 清理 /root/.ssh/authorized_keys
+    if [[ -f /root/.ssh/authorized_keys ]]; then
+        backup_file /root/.ssh/authorized_keys
+        :> /root/.ssh/authorized_keys
+        msg_ok "已清空 /root/.ssh/authorized_keys"
+    else
+        msg_info "/root/.ssh/authorized_keys 不存在，跳过"
+    fi
+
+    # 4. 重启 sshd
+    echo ""
+    if sshd -t 2>/dev/null; then
+        systemctl restart "$sshd_svc" 2>/dev/null || systemctl restart ssh 2>/dev/null
+        msg_ok "$sshd_svc 服务已重启"
+    else
+        msg_err "sshd_config 语法检查失败！请手动检查。备份已保存。"
+        return
+    fi
+
+    # ─── 验证 ───
+    echo ""
+    msg_bold "清理后状态:"
+    if command -v sshd &>/dev/null; then
+        sshd -T 2>/dev/null | grep -E 'permitrootlogin|passwordauthentication|authenticationmethods' || true
+    fi
+    echo ""
+    msg_info "root 公钥状态: $([ -s /root/.ssh/authorized_keys ] && echo '仍有密钥' || echo '已清空')"
+
+    echo ""
+    msg_ok "功能 5 执行完毕。"
+    msg_warn "⚠  请立即新开终端测试密码登录:"
+    echo "  ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no root@$(hostname -I 2>/dev/null | awk '{print $1}' || echo '<IP>')"
+    msg_warn "⚠  测试通过前请勿关闭当前会话！"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
