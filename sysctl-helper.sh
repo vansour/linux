@@ -1124,8 +1124,6 @@ main() {
     main_menu
 }
 
-# 如果直接执行（非 source）或通过 stdin 管道执行，则启动
-# ${BASH_SOURCE[0]} 在 curl | bash 管道场景下为空（unbound），需要 :- 兜底
-if [[ -z "${BASH_SOURCE[0]:-}" ]] || [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
-    main "$@"
-fi
+# 如果非 source（直接执行或 curl|bash 管道），则启动 main
+# return 0 仅在 source 时成功 → 管道/直接执行都走 || 分支
+(return 0 2>/dev/null) || main "$@"
