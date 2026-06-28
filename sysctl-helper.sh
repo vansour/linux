@@ -147,18 +147,17 @@ func_enable_bbr_stage1_clean() {
         done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
     fi
 
-    # 检查 /etc/sysctl.conf，若包含目标参数则备份后注释（不完全删除，避免影响其他配置）
+    # 检查 /etc/sysctl.conf（已弃用），包含目标参数则直接删除
     if [[ -f /etc/sysctl.conf ]]; then
-        local sysctl_modified=0
         for key in "${targets[@]}"; do
             if grep -qE "^\s*${key}\s*=" /etc/sysctl.conf 2>/dev/null; then
-                [[ $sysctl_modified -eq 0 ]] && backup_file /etc/sysctl.conf
-                sed -i "s|^\\(\\s*${key}\\s*=\\)|# \\1|" /etc/sysctl.conf
-                msg_info "已注释 /etc/sysctl.conf 中的 $key"
-                sysctl_modified=1
+                backup_file /etc/sysctl.conf
+                rm -f /etc/sysctl.conf
+                msg_info "已删除: /etc/sysctl.conf (包含 $key，此文件已弃用)"
+                cleaned=1
+                break
             fi
         done
-        [[ $sysctl_modified -eq 1 ]] && cleaned=1
     fi
 
     # 重置当前内核参数
