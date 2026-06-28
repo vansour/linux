@@ -333,6 +333,89 @@ func_enable_bbr() {
     msg_ok "功能 1 执行完毕。"
 }
 
+# ─── 功能 2：开启时间同步 (NTP) ───
+
+func_enable_ntp() {
+    echo ""
+    msg_bold "══════════ 功能 2：开启时间同步 (NTP) ══════════"
+    echo ""
+
+    echo -e "${C_BLUE}当前时间同步状态:${C_RESET}"
+    timedatectl status 2>/dev/null || true
+    echo ""
+
+    # 检测可用的 NTP 后端
+    local use_timesyncd=0
+    local use_chrony=0
+
+    if systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
+        use_timesyncd=1
+        msg_info "检测到 systemd-timesyncd 可用（系统内置）"
+    fi
+
+    msg_info "此操作将:"
+    echo "  - 启用 NTP 时间同步"
+    if [[ $use_timesyncd -eq 1 ]]; then
+        echo "  - 使用 systemd-timesyncd（系统内置）"
+        echo "  - 配置 NTP 服务器: pool.ntp.org"
+    else
+        echo "  - 安装并使用 chrony"
+    fi
+    echo ""
+
+    confirm "是否继续？" || { msg_info "已取消"; return; }
+
+    if [[ $use_timesyncd -eq 1 ]]; then
+        # 配置 NTP 服务器
+        if [[ -f "$TIMESYNCD_CONF" ]]; then
+            backup_file "$TIMESYNCD_CONF"
+            # 取消注释并设置 NTP 服务器
+            sed -i 's/^#\s*NTP=/NTP=/' "$TIMESYNCD_CONF"
+            if ! grep -q '^NTP=.*pool.ntp.org' "$TIMESYNCD_CONF" 2>/dev/null; then
+                # 替换已有的 NTP= 行
+                if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
+                    sed -i 's/^NTP=.*/NTP=pool.ntp.org/' "$TIMESYNCD_CONF"
+                else
+                    echo "NTP=pool.ntp.org" >> "$TIMESYNCD_CONF"
+                fi
+            fi
+        fi
+
+        # 启用 NTP
+        timedatectl set-ntp true 2>/dev/null || msg_warn "timedatectl set-ntp 失败，尝试手动操作"
+
+        # 重启 timesyncd
+        systemctl restart systemd-timesyncd 2>/dev/null || true
+        systemctl enable systemd-timesyncd 2>/dev/null || true
+
+        msg_ok "systemd-timesyncd 配置完成"
+    else
+        # 退化到 chrony
+        msg_info "安装 chrony..."
+        apt update -qq 2>/dev/null
+        apt install -y chrony 2>/dev/null || { msg_err "chrony 安装失败"; return; }
+
+        systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
+        msg_ok "chrony 安装并启动完成"
+    fi
+
+    echo ""
+    msg_bold "验证当前时间同步状态:"
+    timedatectl status 2>/dev/null || true
+
+    # 检查 NTP 同步是否为 active
+    local ntp_active
+    ntp_active=$(timedatectl show -p NTP --value 2>/dev/null || echo "unknown")
+    if [[ "$ntp_active" == "yes" ]]; then
+        msg_ok "NTP 时间同步已启用 ✓"
+    else
+        msg_warn "NTP 状态: $ntp_active，请检查"
+    fi
+
+    echo ""
+    msg_ok "功能 2 执行完毕。"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
