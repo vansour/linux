@@ -1199,8 +1199,133 @@ func_show_status() {
         msg_info "目录不存在"
     fi
 
+    # ── IPv6 ──
+    echo ""
+    echo -e "${C_BOLD}── IPv6 ──${C_RESET}"
+    local ipv6_all ipv6_default ipv6_grub
+    ipv6_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown")
+    ipv6_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "unknown")
+    if [[ "$ipv6_all" == "0" ]]; then
+        msg_ok "IPv6: 已启用"
+    elif [[ "$ipv6_all" == "1" ]]; then
+        msg_warn "IPv6: 已禁用"
+    else
+        msg_info "IPv6: $ipv6_all"
+    fi
+    echo "  net.ipv6.conf.all.disable_ipv6 = $ipv6_all"
+    echo "  net.ipv6.conf.default.disable_ipv6 = $ipv6_default"
+    if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
+        msg_warn "GRUB: ipv6.disable=1 (重启后生效)"
+    fi
+
     echo ""
     msg_ok "状态查看完毕。"
+}
+
+# ─── 功能 7：开启/禁用 IPv6 ───
+
+func_toggle_ipv6() {
+    echo ""
+    msg_bold "══════════ 功能 7：开启/禁用 IPv6 ══════════"
+    echo ""
+
+    local IPV6_CONF="/etc/sysctl.d/99-disable-ipv6.conf"
+
+    # 显示当前状态
+    local cur_all cur_default
+    cur_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+    cur_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "0")
+
+    echo -e "${C_BLUE}当前 IPv6 状态:${C_RESET}"
+    if [[ "$cur_all" == "1" ]]; then
+        msg_warn "IPv6 已禁用 (all.disable_ipv6=1)"
+    else
+        msg_ok "IPv6 已启用 (all.disable_ipv6=0)"
+    fi
+    echo "  net.ipv6.conf.all.disable_ipv6 = $cur_all"
+    echo "  net.ipv6.conf.default.disable_ipv6 = $cur_default"
+
+    # 检查 GRUB 是否设了 ipv6.disable
+    if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
+        msg_warn "GRUB 内核参数: ipv6.disable=1 (需重启生效)"
+    fi
+    echo ""
+
+    # 子菜单
+    echo "  1. 禁用 IPv6"
+    echo "  2. 开启 IPv6"
+    echo "  0. 返回"
+    echo ""
+
+    local action
+    echo -ne "${C_BOLD}请选择 [0-2]: ${C_RESET}"
+    read -r action
+    echo ""
+
+    case "$action" in
+        1)
+            msg_info "正在禁用 IPv6..."
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+            # 持久化
+            cat > "$IPV6_CONF" <<'EOF'
+# 禁用 IPv6 — 由 sysctl-helper 设置
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+            msg_ok "已写入 $IPV6_CONF"
+            sysctl -p "$IPV6_CONF" >/dev/null 2>&1
+            msg_ok "IPv6 已即时禁用 ✓"
+
+            # 询问是否添加 GRUB 内核参数（完全关闭需重启）
+            echo ""
+            confirm "是否同时添加 ipv6.disable=1 到 GRUB 内核参数？(彻底关闭，需重启生效)" && {
+                backup_file /etc/default/grub
+                if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub 2>/dev/null; then
+                    if ! grep -q 'ipv6.disable=1' /etc/default/grub; then
+                        sed -i 's|^GRUB_CMDLINE_LINUX="\(.*\)"|GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"|' /etc/default/grub
+                        msg_ok "已添加 ipv6.disable=1 到 GRUB"
+                        msg_warn "请手动执行 update-grub 并重启以完全生效"
+                    else
+                        msg_info "GRUB 已包含 ipv6.disable=1"
+                    fi
+                fi
+            }
+            ;;
+        2)
+            msg_info "正在开启 IPv6..."
+
+            # 删除禁用配置文件
+            if [[ -f "$IPV6_CONF" ]]; then
+                rm -f "$IPV6_CONF"
+                msg_info "已删除: $IPV6_CONF"
+            fi
+
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
+            msg_ok "IPv6 已即时开启 ✓"
+
+            # 询问是否移除 GRUB 参数
+            if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
+                echo ""
+                confirm "是否移除 GRUB 中的 ipv6.disable=1？" && {
+                    backup_file /etc/default/grub
+                    sed -i 's/\s*ipv6\.disable=1//' /etc/default/grub
+                    msg_ok "已从 GRUB 移除 ipv6.disable=1"
+                    msg_warn "请手动执行 update-grub 并重启以完全生效"
+                }
+            fi
+            ;;
+        0)
+            msg_info "已取消"
+            ;;
+        *)
+            msg_err "无效选项"
+            ;;
+    esac
+
+    echo ""
+    msg_ok "功能 7 执行完毕。"
 }
 
 # ─── 主菜单 ───
@@ -1231,10 +1356,11 @@ main_menu() {
         echo "  4. 开启 root 密码登录"
         echo "  5. 删除 SSH 密钥，仅用密码登录"
         echo "  6. 查看当前状态"
+        echo "  7. 开启/禁用 IPv6"
         echo "  0. 退出"
         echo ""
         local choice
-        echo -ne "${C_BOLD}请输入选项 [0-6]: ${C_RESET}"
+        echo -ne "${C_BOLD}请输入选项 [0-7]: ${C_RESET}"
         read -r choice
         echo ""
 
@@ -1245,11 +1371,12 @@ main_menu() {
             4) func_enable_root_login || msg_err "操作失败" ;;
             5) func_remove_keys || msg_err "操作失败" ;;
             6) func_show_status || msg_err "操作失败" ;;
+            7) func_toggle_ipv6 || msg_err "操作失败" ;;
             0) msg_info "再见！"; exit 0 ;;
             *) msg_err "无效选项，请重试" ;&
         esac
 
-        if [[ "$choice" =~ ^[1-6]$ ]]; then
+        if [[ "$choice" =~ ^[1-7]$ ]]; then
             echo ""
             echo -ne "${C_BOLD}按 Enter 返回菜单...${C_RESET}"
             read -r
