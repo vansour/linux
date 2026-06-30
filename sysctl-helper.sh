@@ -1199,6 +1199,19 @@ EOF
 
 # ─── 功能 7：配置 Swap ───
 
+_create_swap_file() {
+    local path="$1" size_mb="$2"
+    local fstype
+    fstype=$(df --output=fstype "$(dirname "$path")" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ "$fstype" == "ext4" || "$fstype" == "xfs" ]]; then
+        msg_info "文件系统: $fstype，使用 fallocate"
+        fallocate -l "${size_mb}M" "$path"
+    else
+        msg_info "文件系统: ${fstype:-unknown}，使用 dd"
+        dd if=/dev/zero of="$path" bs=1M count="$size_mb" status=progress 2>/dev/null
+    fi
+}
+
 func_configure_swap() {
     echo ""
     msg_bold "══════════ 功能 7：配置 Swap ══════════"
@@ -1284,7 +1297,7 @@ func_configure_swap() {
             echo ""
 
             # 创建 swap 文件
-            if dd if=/dev/zero of="$DEFAULT_SWAPFILE" bs=1M count="$swap_size_mb" status=progress 2>/dev/null; then
+            if _create_swap_file "$DEFAULT_SWAPFILE" "$swap_size_mb"; then
                 msg_ok "Swap 文件已创建"
             else
                 msg_err "创建 Swap 文件失败"
@@ -1491,7 +1504,7 @@ func_configure_swap() {
             msg_info "正在创建: $DEFAULT_SWAPFILE (${new_size_mb} MB)..."
             echo ""
 
-            if dd if=/dev/zero of="$DEFAULT_SWAPFILE" bs=1M count="$new_size_mb" status=progress 2>/dev/null; then
+            if _create_swap_file "$DEFAULT_SWAPFILE" "$new_size_mb"; then
                 msg_ok "Swap 文件已创建"
             else
                 msg_err "创建 Swap 文件失败"
