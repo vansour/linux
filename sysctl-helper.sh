@@ -18,7 +18,7 @@ else
 fi
 
 # ─── 常量路径 ───
-readonly SYSTCLD_DIR="/etc/sysctl.d"
+readonly SYSCTL_DIR="/etc/sysctl.d"
 readonly BBR_CONF="/etc/sysctl.d/99-bbr.conf"
 readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 readonly SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
@@ -122,13 +122,13 @@ func_enable_bbr_stage1_clean() {
     echo ""
 
     # 删除所有 sysctl 配置文件
-    if [[ -d "$SYSTCLD_DIR" ]]; then
+    if [[ -d "$SYSCTL_DIR" ]]; then
         local count=0
         while IFS= read -r -d '' f; do
             rm -f "$f"
             msg_info "已删除: $f"
             ((count++))
-        done < <(find "$SYSTCLD_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
+        done < <(find "$SYSCTL_DIR" -name '*.conf' -type f -print0 2>/dev/null || true)
         [[ $count -gt 0 ]] && msg_info "共删除 $count 个文件"
     fi
 
@@ -167,12 +167,9 @@ func_enable_bbr_stage2_apply() {
         return 1
     fi
 
-    # 加载 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        msg_err "无法加载 tcp_bbr 模块。请确认内核已编译 BBR 支持 (CONFIG_TCP_CONG_BBR=m 或 y)"
-        return 1
-    fi
-    msg_ok "tcp_bbr 模块已加载"
+    # BBR 可内建(=y)或模块(=m)；modprobe 对内建返回非零，所以不依赖其返回值
+    modprobe tcp_bbr 2>/dev/null || true
+    lsmod 2>/dev/null | grep -q '^tcp_bbr' && msg_ok "tcp_bbr 模块已加载"
 
     # 写入配置文件
     cat > "$BBR_CONF" <<'EOF'
@@ -251,27 +248,8 @@ func_enable_bbr_stage4_bpftune() {
         if apt update -qq 2>/dev/null && apt install -y bpftune 2>/dev/null; then
             msg_ok "bpftune 通过 apt 安装成功"
         else
-            msg_info "apt 不可用或未收录，尝试从 GitHub Releases 下载..."
-            local latest_deb
-            latest_deb=$(curl -s "https://api.github.com/repos/oracle-samples/bpftune/releases/latest" 2>/dev/null \
-                | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb' | head -1)
-            if [[ -n "$latest_deb" ]]; then
-                local tmp_deb="/tmp/bpftune_latest.deb"
-                msg_info "下载: $latest_deb"
-                if curl -sL -o "$tmp_deb" "$latest_deb"; then
-                    dpkg -i "$tmp_deb" && apt install -f -y 2>/dev/null
-                    rm -f "$tmp_deb"
-                    msg_ok "bpftune .deb 安装完成"
-                else
-                    msg_err "下载失败"
-                    msg_warn "请手动安装: https://github.com/oracle-samples/bpftune/releases"
-                    return 1
-                fi
-            else
-                msg_err "未找到 bpftune release 的 .deb 文件"
-                msg_warn "请手动安装: https://github.com/oracle-samples/bpftune/releases"
-                return 1
-            fi
+            msg_warn "apt 源未收录 bpftune，请手动安装: https://github.com/oracle-samples/bpftune/releases"
+            return 1
         fi
     fi
 
@@ -337,87 +315,31 @@ func_enable_bbr() {
 # ─── 功能 2：开启时间同步 (NTP) ───
 
 func_select_timezone() {
-    # 返回: 选中的 timezone 写入全局变量 SELECTED_TIMEZONE
     SELECTED_TIMEZONE=""
 
+    local all_tzs
+    mapfile -t all_tzs < <(timedatectl list-timezones 2>/dev/null)
+    local total=${#all_tzs[@]}
+
     echo ""
-    msg_bold "── 选择时区 ──"
+    msg_bold "-- 选择时区（共 ${total} 个）--"
+    echo ""
+
+    timedatectl list-timezones 2>/dev/null | nl -w3 -s". " | column -c 120
     echo ""
     echo "  0. 跳过（不修改时区）"
-    echo "  1. 手动输入时区名称"
-    echo "  2. 搜索时区（输入关键词）"
-    echo "  3. 常用时区列表"
     echo ""
+    echo -ne "${C_BOLD}请输入编号 (0-${total}): ${C_RESET}"
+    local tz_num
+    read -r tz_num
 
-    local tz_choice
-    echo -ne "${C_BOLD}请选择 [0-3]: ${C_RESET}"
-    read -r tz_choice
-
-    case "$tz_choice" in
-        0)
-            msg_info "跳过时区设置"
-            ;;
-        1)
-            echo ""
-            echo -ne "${C_BOLD}请输入时区名称（如 Asia/Shanghai）: ${C_RESET}"
-            read -r SELECTED_TIMEZONE
-            ;;
-        2)
-            echo ""
-            echo -ne "${C_BOLD}输入搜索关键词（如 Shanghai、Tokyo、New_York）: ${C_RESET}"
-            local keyword
-            read -r keyword
-            echo ""
-            if [[ -n "$keyword" ]]; then
-                timedatectl list-timezones 2>/dev/null | grep -i "$keyword" || msg_warn "未找到匹配 \"$keyword\" 的时区"
-                echo ""
-                echo -ne "${C_BOLD}从上方列表输入时区名称: ${C_RESET}"
-                read -r SELECTED_TIMEZONE
-            fi
-            ;;
-        3)
-            echo ""
-            echo "  Asia  │  美洲    │  欧洲     │  大洋洲   │  非洲"
-            echo "  ──────│──────────│──────────│──────────│──────────"
-            echo "  1. Shanghai  7. New_York   13. London   19. Sydney   25. Cairo"
-            echo "  2. Tokyo     8. Chicago    14. Paris    20. Auckland 26. Johannesburg"
-            echo "  3. Singapore 9. Los_Angeles 15. Berlin  21. Melbourne"
-            echo "  4. Hong_Kong 10. Vancouver 16. Moscow"
-            echo "  5. Dubai     11. Toronto   17. Amsterdam"
-            echo "  6. Kolkata   12. Sao_Paulo 18. Zurich"
-            echo ""
-            local common=(
-                "Asia/Shanghai" "Asia/Tokyo" "Asia/Singapore" "Asia/Hong_Kong"
-                "Asia/Dubai" "Asia/Kolkata"
-                "America/New_York" "America/Chicago" "America/Los_Angeles"
-                "America/Vancouver" "America/Toronto" "America/Sao_Paulo"
-                "Europe/London" "Europe/Paris" "Europe/Berlin" "Europe/Moscow"
-                "Europe/Amsterdam" "Europe/Zurich"
-                "Australia/Sydney" "Pacific/Auckland" "Australia/Melbourne"
-                "Africa/Cairo" "Africa/Johannesburg"
-            )
-            echo -ne "${C_BOLD}输入编号 (1-${#common[@]}): ${C_RESET}"
-            local tz_num
-            read -r tz_num
-            if [[ "$tz_num" =~ ^[0-9]+$ ]] && [[ "$tz_num" -ge 1 ]] && [[ "$tz_num" -le ${#common[@]} ]]; then
-                SELECTED_TIMEZONE="${common[$((tz_num - 1))]}"
-            else
-                msg_err "无效编号"
-            fi
-            ;;
-        *)
-            msg_err "无效选项"
-            ;;
-    esac
-
-    if [[ -n "$SELECTED_TIMEZONE" ]]; then
-        # 验证时区是否存在
-        if timedatectl list-timezones 2>/dev/null | grep -qxF "$SELECTED_TIMEZONE"; then
-            msg_ok "已选择时区: $SELECTED_TIMEZONE"
-        else
-            msg_err "无效时区: $SELECTED_TIMEZONE"
-            SELECTED_TIMEZONE=""
-        fi
+    if [[ "$tz_num" == "0" ]]; then
+        msg_info "跳过时区设置"
+    elif [[ "$tz_num" =~ ^[0-9]+$ ]] && [[ "$tz_num" -ge 1 ]] && [[ "$tz_num" -le "$total" ]]; then
+        SELECTED_TIMEZONE="${all_tzs[$((tz_num - 1))]}"
+        msg_ok "已选择时区: $SELECTED_TIMEZONE"
+    else
+        msg_err "无效编号，请输入 0-${total}"
     fi
 }
 
@@ -471,14 +393,26 @@ func_select_ntp_server() {
     msg_ok "已选择 NTP 服务器: $SELECTED_NTP_SERVERS"
 }
 
+# ─── 展示 NTP 状态（格式化） ───
+
+_show_ntp_status() {
+    local tz ntp_svc synced local_t
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "?")
+    ntp_svc=$(timedatectl show -p NTP --value 2>/dev/null || echo "?")
+    synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "?")
+    local_t=$(timedatectl show -p TimeUSec --value 2>/dev/null || echo "?")
+    [[ "$ntp_svc" == "yes" ]] && msg_ok "NTP 服务: 已启用" || msg_warn "NTP 服务: $ntp_svc"
+    [[ "$synced" == "yes" ]] && msg_ok "同步状态: 已同步" || msg_warn "同步状态: $synced"
+    msg_info "本地时间: $local_t"
+    msg_info "时区: $tz"
+}
+
 func_enable_ntp() {
     echo ""
     msg_bold "══════════ 功能 2：开启时间同步 (NTP) ══════════"
     echo ""
 
-    echo -e "${C_BLUE}当前时间同步状态:${C_RESET}"
-    timedatectl status 2>/dev/null || true
-    echo ""
+    _show_ntp_status
 
     # 检测可用的 NTP 后端
     local use_timesyncd=0
@@ -556,8 +490,7 @@ func_enable_ntp() {
     fi
 
     echo ""
-    msg_bold "验证当前时间同步状态:"
-    timedatectl status 2>/dev/null || true
+    _show_ntp_status
 
     # 检查 NTP 同步是否为 active
     local ntp_active
@@ -1201,17 +1134,29 @@ EOF
 
 _create_swap_file() {
     local path="$1" size_mb="$2"
-    local fstype
-    fstype=$(df --output=fstype "$(dirname "$path")" 2>/dev/null | tail -1 | tr -d ' ')
-    if [[ "$fstype" == "ext4" || "$fstype" == "xfs" ]]; then
-        msg_info "文件系统: $fstype，使用 fallocate"
-        fallocate -l "${size_mb}M" "$path"
-    else
-        msg_info "文件系统: ${fstype:-unknown}，使用 dd"
-        dd if=/dev/zero of="$path" bs=1M count="$size_mb" status=progress 2>/dev/null
-    fi
+    msg_info "正在创建 ${size_mb}MB swap 文件，请等待..."
+    dd if=/dev/zero of="$path" bs=1M count="$size_mb" status=progress 2>/dev/null
 }
 
+
+_create_and_enable_swap() {
+    local path="$1" size_mb="$2"
+    _create_swap_file "$path" "$size_mb" || return 1
+    chmod 600 "$path"
+    msg_info "权限已设为 600"
+    mkswap "$path" >/dev/null 2>&1 || { msg_err "mkswap 失败"; rm -f "$path"; return 1; }
+    msg_ok "mkswap 完成"
+    swapon "$path" 2>/dev/null || { msg_err "swapon 失败"; rm -f "$path"; return 1; }
+    msg_ok "swapon 完成，Swap 已启用"
+    backup_file /etc/fstab
+    if grep -qF "$path" /etc/fstab 2>/dev/null; then
+        sed -i "\|^${path}|s|.*|${path} none swap sw 0 0|" /etc/fstab
+        msg_info "已更新 /etc/fstab 中的 Swap 条目"
+    else
+        echo "${path} none swap sw 0 0" >> /etc/fstab
+        msg_info "已添加 Swap 条目到 /etc/fstab"
+    fi
+}
 func_configure_swap() {
     echo ""
     msg_bold "══════════ 功能 7：配置 Swap ══════════"
@@ -1293,45 +1238,7 @@ func_configure_swap() {
                 return
             fi
 
-            msg_info "正在创建 Swap 文件: $DEFAULT_SWAPFILE (${swap_size_mb} MB)..."
-            echo ""
-
-            # 创建 swap 文件
-            if _create_swap_file "$DEFAULT_SWAPFILE" "$swap_size_mb"; then
-                msg_ok "Swap 文件已创建"
-            else
-                msg_err "创建 Swap 文件失败"
-                return
-            fi
-
-            chmod 600 "$DEFAULT_SWAPFILE"
-            msg_info "权限已设为 600"
-
-            if mkswap "$DEFAULT_SWAPFILE" >/dev/null 2>&1; then
-                msg_ok "mkswap 完成"
-            else
-                msg_err "mkswap 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            if swapon "$DEFAULT_SWAPFILE" 2>/dev/null; then
-                msg_ok "swapon 完成，Swap 已启用"
-            else
-                msg_err "swapon 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            # 写入 fstab
-            backup_file /etc/fstab
-            if grep -qF "$DEFAULT_SWAPFILE" /etc/fstab 2>/dev/null; then
-                sed -i "\|^${DEFAULT_SWAPFILE}|s|.*|${DEFAULT_SWAPFILE} none swap sw 0 0|" /etc/fstab
-                msg_info "已更新 /etc/fstab 中的 Swap 条目"
-            else
-                echo "${DEFAULT_SWAPFILE} none swap sw 0 0" >> /etc/fstab
-                msg_info "已添加 Swap 条目到 /etc/fstab"
-            fi
+            _create_and_enable_swap "$DEFAULT_SWAPFILE" "$swap_size_mb" || return
 
             echo ""
             msg_bold "当前 Swap 状态:"
@@ -1501,38 +1408,7 @@ func_configure_swap() {
                 rm -f "$DEFAULT_SWAPFILE"
             fi
 
-            msg_info "正在创建: $DEFAULT_SWAPFILE (${new_size_mb} MB)..."
-            echo ""
-
-            if _create_swap_file "$DEFAULT_SWAPFILE" "$new_size_mb"; then
-                msg_ok "Swap 文件已创建"
-            else
-                msg_err "创建 Swap 文件失败"
-                return
-            fi
-
-            chmod 600 "$DEFAULT_SWAPFILE"
-
-            if mkswap "$DEFAULT_SWAPFILE" >/dev/null 2>&1; then
-                msg_ok "mkswap 完成"
-            else
-                msg_err "mkswap 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            if swapon "$DEFAULT_SWAPFILE" 2>/dev/null; then
-                msg_ok "swapon 完成，Swap 已启用"
-            else
-                msg_err "swapon 失败"
-                rm -f "$DEFAULT_SWAPFILE"
-                return
-            fi
-
-            # 写入 fstab
-            echo "${DEFAULT_SWAPFILE} none swap sw 0 0" >> /etc/fstab
-            msg_info "已添加 Swap 条目到 /etc/fstab"
-
+            _create_and_enable_swap "$DEFAULT_SWAPFILE" "$new_size_mb" || return
             echo ""
             msg_bold "调整后 Swap 状态:"
             swapon --show 2>/dev/null
