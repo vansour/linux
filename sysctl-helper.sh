@@ -385,17 +385,22 @@ func_select_ntp_server() {
 }
 
 _show_ntp_status() {
-    local tz ntp_svc synced local_t
+    local tz local_t
     tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "?")
-    ntp_svc=$(timedatectl show -p NTP --value 2>/dev/null || echo "?")
-    synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "?")
     local_t=$(timedatectl show -p TimeUSec --value 2>/dev/null || echo "?")
-    [[ "$ntp_svc" == "yes" ]] && msg_ok "NTP 服务: 已启用" || msg_warn "NTP 服务: $ntp_svc"
-    [[ "$synced" == "yes" ]] && msg_ok "同步状态: 已同步" || msg_warn "同步状态: $synced"
+    if systemctl is-active --quiet chrony 2>/dev/null; then
+        msg_ok "NTP 服务: chrony (运行中)"
+        if chronyc tracking 2>/dev/null | grep -qE 'Stratum\s*:\s*[0-9]+'; then
+            msg_ok "同步状态: 已同步"
+        else
+            msg_warn "同步状态: 未同步"
+        fi
+    else
+        msg_warn "NTP 服务: chrony (未运行)"
+    fi
     msg_info "本地时间: $local_t"
     msg_info "时区: $tz"
 }
-
 
 func_enable_ntp() {
     echo ""
@@ -448,18 +453,6 @@ func_enable_ntp() {
     # 启动 chrony
     systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
     msg_ok "chrony 已安装并启动"
-
-    echo ""
-    _show_ntp_status
-
-    local ntp_active
-    ntp_active=$(timedatectl show -p NTP --value 2>/dev/null || echo "unknown")
-    if [[ "$ntp_active" == "yes" ]]; then
-        msg_ok "NTP 时间同步已启用 ✓"
-    else
-        msg_warn "NTP 状态: $ntp_active，请检查"
-    fi
-
     echo ""
     msg_ok "功能 2 执行完毕。"
 }
