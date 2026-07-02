@@ -22,7 +22,6 @@ readonly SYSCTL_DIR="/etc/sysctl.d"
 readonly BBR_CONF="/etc/sysctl.d/99-bbr.conf"
 readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 readonly SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
-readonly TIMESYNCD_CONF="/etc/systemd/timesyncd.conf"
 readonly BACKUP_SUFFIX=".bak.$(date +%Y%m%d-%H%M%S)"
 
 # ─── 工具函数 ───
@@ -405,23 +404,10 @@ func_enable_ntp() {
 
     _show_ntp_status
 
-    # 检测可用的 NTP 后端
-    local use_timesyncd=0
-
-    if systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
-        use_timesyncd=1
-        msg_info "检测到 systemd-timesyncd 可用（系统内置）"
-    fi
-
     msg_info "此操作将:"
     echo "  - 选择并设置时区"
     echo "  - 选择 NTP 服务器"
-    echo "  - 启用 NTP 时间同步"
-    if [[ $use_timesyncd -eq 1 ]]; then
-        echo "  - 使用 systemd-timesyncd（系统内置）"
-    else
-        echo "  - 安装并使用 chrony"
-    fi
+    echo "  - 安装 chrony 并启用 NTP 时间同步"
     echo ""
 
     confirm "是否继续？" || { msg_info "已取消"; return; }
@@ -439,51 +425,35 @@ func_enable_ntp() {
     # ─── 选择 NTP 服务器 ───
     func_select_ntp_server
 
-    if [[ $use_timesyncd -eq 1 ]]; then
-        # 配置 NTP 服务器
-        if [[ -f "$TIMESYNCD_CONF" ]]; then
-            backup_file "$TIMESYNCD_CONF"
-            # 取消注释并设置 NTP 服务器
-            sed -i 's/^#\s*NTP=/NTP=/' "$TIMESYNCD_CONF"
-            if grep -q '^NTP=' "$TIMESYNCD_CONF" 2>/dev/null; then
-                sed -i "s|^NTP=.*|NTP=${SELECTED_NTP_SERVERS}|" "$TIMESYNCD_CONF"
-            else
-                echo "NTP=${SELECTED_NTP_SERVERS}" >> "$TIMESYNCD_CONF"
-            fi
-            msg_info "NTP 服务器已写入: $TIMESYNCD_CONF"
-        fi
-
-        # 启用 NTP
-        timedatectl set-ntp true 2>/dev/null || msg_warn "timedatectl set-ntp 失败，尝试手动操作"
-
-        # 重启 timesyncd
-        systemctl restart systemd-timesyncd 2>/dev/null || true
-        systemctl enable systemd-timesyncd 2>/dev/null || true
-
-        msg_ok "systemd-timesyncd 配置完成"
-    else
-        # 退化到 chrony
-        msg_info "安装 chrony..."
-        apt update -qq 2>/dev/null
-        apt install -y chrony 2>/dev/null || { msg_err "chrony 安装失败"; return; }
-
-        # 配置 chrony NTP 服务器
-        if [[ -f /etc/chrony/chrony.conf ]]; then
-            backup_file /etc/chrony/chrony.conf
-            sed -i 's/^pool .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
-            sed -i 's/^server .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
-            echo "server ${SELECTED_NTP_SERVERS} iburst" >> /etc/chrony/chrony.conf
-            msg_info "NTP 服务器已写入: /etc/chrony/chrony.conf"
-        fi
-
-        systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
-        msg_ok "chrony 安装并启动完成"
+    # ─── 停止 systemd-timesyncd（避免冲突）───
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        systemctl stop systemd-timesyncd 2>/dev/null || true
+        systemctl disable systemd-timesyncd 2>/dev/null || true
+        msg_info "已停止 systemd-timesyncd"
     fi
+
+    # ─── 安装并配置 chrony ───
+    msg_info "安装 chrony..."
+    apt update -qq 2>/dev/null
+    apt install -y chrony 2>/dev/null || { msg_err "chrony 安装失败"; return; }
+
+    if [[ -f /etc/chrony/chrony.conf ]]; then
+        backup_file /etc/chrony/chrony.conf
+        # 注释掉默认的 pool/server 行
+        sed -i 's/^pool .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
+        sed -i 's/^server .*/# &/' /etc/chrony/chrony.conf 2>/dev/null || true
+        # 写入用户选择的 NTP 服务器
+        echo "server ${SELECTED_NTP_SERVERS} iburst" >> /etc/chrony/chrony.conf
+        msg_info "NTP 服务器已写入: /etc/chrony/chrony.conf"
+    fi
+
+    # 启动 chrony
+    systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
+    msg_ok "chrony 已安装并启动"
 
     echo ""
     _show_ntp_status
 
-    # 检查 NTP 同步是否为 active
     local ntp_active
     ntp_active=$(timedatectl show -p NTP --value 2>/dev/null || echo "unknown")
     if [[ "$ntp_active" == "yes" ]]; then
@@ -495,7 +465,6 @@ func_enable_ntp() {
     echo ""
     msg_ok "功能 2 执行完毕。"
 }
-
 # ─── 功能 3：修改 SSH 端口 ───
 
 func_change_ssh_port() {
