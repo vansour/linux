@@ -344,56 +344,45 @@ func_select_timezone() {
 }
 
 func_select_ntp_server() {
-    # 返回: 选中的 NTP 服务器列表写入全局变量 SELECTED_NTP_SERVERS
-    # 显示常用 NTP 服务器，支持多选（空格分隔）
     SELECTED_NTP_SERVERS=""
 
     echo ""
     msg_bold "── 选择 NTP 服务器 ──"
     echo ""
-    echo "  [全球]"
-    echo "  1. pool.ntp.org          (全球通用)"
-    echo "  2. time.google.com        (Google)"
-    echo "  3. time.cloudflare.com    (Cloudflare)"
+    echo "  1. time.cloudflare.com    (Cloudflare, anycast)"
+    echo "  2. time.google.com        (Google, anycast)"
+    echo "  3. time.apple.com         (Apple, anycast)"
     echo "  4. time.windows.com       (Microsoft)"
-    echo ""
-    echo "  [中国]"
     echo "  5. ntp.aliyun.com         (阿里云)"
     echo "  6. ntp.tencent.com        (腾讯云)"
-    echo "  7. cn.pool.ntp.org        (中国区)"
-    echo "  8. hk.pool.ntp.org        (香港区)"
     echo ""
     echo "  0. 手动输入"
     echo ""
 
-    echo -ne "${C_BOLD}输入编号 (默认 1): ${C_RESET}"
+    echo -ne "${C_BOLD}请输入编号 (默认 1): ${C_RESET}"
     local ntp_choice
     read -r ntp_choice
     ntp_choice="${ntp_choice:-1}"
 
     case "$ntp_choice" in
-        1) SELECTED_NTP_SERVERS="pool.ntp.org" ;;
+        1) SELECTED_NTP_SERVERS="time.cloudflare.com" ;;
         2) SELECTED_NTP_SERVERS="time.google.com" ;;
-        3) SELECTED_NTP_SERVERS="time.cloudflare.com" ;;
+        3) SELECTED_NTP_SERVERS="time.apple.com" ;;
         4) SELECTED_NTP_SERVERS="time.windows.com" ;;
         5) SELECTED_NTP_SERVERS="ntp.aliyun.com" ;;
         6) SELECTED_NTP_SERVERS="ntp.tencent.com" ;;
-        7) SELECTED_NTP_SERVERS="cn.pool.ntp.org" ;;
-        8) SELECTED_NTP_SERVERS="hk.pool.ntp.org" ;;
         0)
             echo -ne "${C_BOLD}请输入 NTP 服务器地址: ${C_RESET}"
             read -r SELECTED_NTP_SERVERS
             ;;
         *)
-            msg_warn "无效选项，使用默认: pool.ntp.org"
-            SELECTED_NTP_SERVERS="pool.ntp.org"
+            msg_warn "无效选项，使用默认: time.cloudflare.com"
+            SELECTED_NTP_SERVERS="time.cloudflare.com"
             ;;
     esac
 
     msg_ok "已选择 NTP 服务器: $SELECTED_NTP_SERVERS"
 }
-
-# ─── 展示 NTP 状态（格式化） ───
 
 _show_ntp_status() {
     local tz ntp_svc synced local_t
@@ -406,6 +395,7 @@ _show_ntp_status() {
     msg_info "本地时间: $local_t"
     msg_info "时区: $tz"
 }
+
 
 func_enable_ntp() {
     echo ""
