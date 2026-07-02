@@ -425,13 +425,11 @@ func_enable_ntp() {
     # ─── 选择 NTP 服务器 ───
     func_select_ntp_server
 
-    # ─── 停止 systemd-timesyncd（避免冲突）───
-    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        systemctl stop systemd-timesyncd 2>/dev/null || true
-        systemctl disable systemd-timesyncd 2>/dev/null || true
-        msg_info "已停止 systemd-timesyncd"
-    fi
-
+    # ─── 卸载 systemd-timesyncd（避免与 chrony 冲突）───
+    systemctl stop systemd-timesyncd 2>/dev/null || true
+    systemctl disable systemd-timesyncd 2>/dev/null || true
+    apt remove -y systemd-timesyncd 2>/dev/null || true
+    msg_info "systemd-timesyncd 已卸载"
     # ─── 安装并配置 chrony ───
     msg_info "安装 chrony..."
     apt update -qq 2>/dev/null
