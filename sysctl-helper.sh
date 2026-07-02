@@ -72,7 +72,6 @@ check_root() {
     fi
 }
 
-
 check_deps() {
     local missing=()
     command -v column >/dev/null 2>&1 || missing+=("bsdmainutils")
@@ -465,10 +464,6 @@ func_enable_ntp() {
     # 启动 chrony
     systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
     msg_ok "chrony 已安装并启动"
-    echo ""
-    sleep 3
-    msg_bold "── timedatectl 最终状态 ──"
-    timedatectl status 2>/dev/null || true
     echo ""
     msg_ok "功能 2 执行完毕。"
 }
@@ -1104,7 +1099,6 @@ _create_swap_file() {
     msg_info "正在创建 ${size_mb}MB swap 文件，请等待..."
     dd if=/dev/zero of="$path" bs=1M count="$size_mb" status=progress 2>/dev/null
 }
-
 
 _create_and_enable_swap() {
     local path="$1" size_mb="$2"
