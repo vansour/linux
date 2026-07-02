@@ -466,6 +466,9 @@ func_enable_ntp() {
     systemctl enable --now chrony 2>/dev/null || { msg_err "chrony 启动失败"; return; }
     msg_ok "chrony 已安装并启动"
     echo ""
+    msg_bold "── timedatectl 最终状态 ──"
+    timedatectl status 2>/dev/null || true
+    echo ""
     msg_ok "功能 2 执行完毕。"
 }
 # ─── 功能 3：修改 SSH 端口 ───
