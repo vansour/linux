@@ -1378,6 +1378,39 @@ func_configure_swap() {
     msg_ok "功能 7 执行完毕。"
 }
 
+# ─── 功能 8：删除所有备份文件 ───
+
+func_clean_backups() {
+    echo ""
+    msg_bold "══════════ 功能 8：删除所有备份文件 ══════════"
+    echo ""
+
+    local files=()
+    while IFS= read -r -d '' f; do
+        files+=("$f")
+    done < <(find /etc /root/.ssh -name '*.bak.*' -type f -print0 2>/dev/null || true)
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        msg_info "未找到备份文件"
+        return
+    fi
+
+    echo -e "${C_BOLD}将删除以下 ${#files[@]} 个备份文件:${C_RESET}"
+    for f in "${files[@]}"; do
+        echo "  $f"
+    done
+    echo ""
+
+    confirm "确认删除？" || { msg_info "已取消"; return; }
+
+    for f in "${files[@]}"; do
+        rm -f "$f"
+        msg_info "已删除: $f"
+    done
+
+    msg_ok "共删除 ${#files[@]} 个备份文件"
+}
+
 # ─── 主菜单 ───
 
 print_banner() {
@@ -1407,10 +1440,11 @@ main_menu() {
         echo "  5. 删除 SSH 密钥，仅用密码登录"
         echo "  6. 开启/禁用 IPv6"
         echo "  7. 配置 Swap"
+        echo "  8. 删除所有备份文件"
         echo "  0. 退出"
         echo ""
         local choice
-        echo -ne "${C_BOLD}请输入选项 [0-7]: ${C_RESET}"
+        echo -ne "${C_BOLD}请输入选项 [0-8]: ${C_RESET}"
         read -r choice
         echo ""
 
@@ -1422,11 +1456,12 @@ main_menu() {
             5) func_remove_keys || msg_err "操作失败" ;;
             6) func_toggle_ipv6 || msg_err "操作失败" ;;
             7) func_configure_swap || msg_err "操作失败" ;;
+            8) func_clean_backups || msg_err "操作失败" ;;
             0) msg_info "再见！"; exit 0 ;;
             *) msg_err "无效选项，请重试" ;&
         esac
 
-        if [[ "$choice" =~ ^[1-7]$ ]]; then
+        if [[ "$choice" =~ ^[1-8]$ ]]; then
             echo ""
             echo -ne "${C_BOLD}按 Enter 返回菜单...${C_RESET}"
             read -r
