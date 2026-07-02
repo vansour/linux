@@ -72,6 +72,18 @@ check_root() {
     fi
 }
 
+
+check_deps() {
+    local missing=()
+    command -v column >/dev/null 2>&1 || missing+=("bsdmainutils")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        msg_info "正在安装依赖: ${missing[*]}"
+        apt update -qq 2>/dev/null
+        apt install -y "${missing[@]}" 2>/dev/null || msg_warn "部分依赖安装失败"
+    fi
+}
+
 check_os() {
     if [[ ! -f /etc/os-release ]]; then
         msg_err "无法检测操作系统（/etc/os-release 不存在）"
@@ -324,7 +336,7 @@ func_select_timezone() {
     msg_bold "-- 选择时区（共 ${total} 个）--"
     echo ""
 
-    timedatectl list-timezones 2>/dev/null | nl -w3 -s". " | { command -v column >/dev/null 2>&1 && column -c 120 || pr -t -4 -W 120; }
+    timedatectl list-timezones 2>/dev/null | nl -w3 -s". " | column -c 120
     echo ""
     echo "  0. 跳过（不修改时区）"
     echo ""
@@ -1471,6 +1483,7 @@ main_menu() {
 
 main() {
     check_root
+    check_deps
     check_os || exit 1
     main_menu
 }
