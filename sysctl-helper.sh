@@ -324,7 +324,7 @@ func_select_timezone() {
     msg_bold "-- 选择时区（共 ${total} 个）--"
     echo ""
 
-    timedatectl list-timezones 2>/dev/null | nl -w3 -s". " | column -c 120
+    timedatectl list-timezones 2>/dev/null | nl -w3 -s". " | { command -v column >/dev/null 2>&1 && column -c 120 || pr -t -4 -W 120; }
     echo ""
     echo "  0. 跳过（不修改时区）"
     echo ""
