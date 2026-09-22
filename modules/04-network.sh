@@ -386,7 +386,10 @@ _dot_is_enabled() {
     if [[ -s "$RESOLVED_DOT_DROPIN" ]] && grep -qE '^\s*DNSOverTLS\s*=\s*yes' "$RESOLVED_DOT_DROPIN" 2>/dev/null; then
         return 0
     fi
-    if have_cmd systemctl && systemctl is-active --quiet stubby 2>/dev/null; then
+    # stubby 在跑还不够 —— Debian 的包安装完就会带着默认配置自启动
+    # （默认上游是 Sinodun 的测试服务器）。必须确认跑的是我们生成的配置。
+    if have_cmd systemctl && systemctl is-active --quiet stubby 2>/dev/null \
+       && grep -q '由 Linux 一键配置脚本生成' "$STUBBY_CONF" 2>/dev/null; then
         return 0
     fi
     return 1
@@ -451,18 +454,32 @@ _dot_apply_resolved() {
 _dot_port53_free() {
     local holder
     if have_cmd ss; then
-        holder="$(ss -tulnpH 'sport = :53' 2>/dev/null | grep -E '127\.0\.0\.1|0\.0\.0\.0|\*' || true)"
+        holder="$(ss -tulnpH 'sport = :53' 2>/dev/null || true)"
     elif have_cmd netstat; then
-        holder="$(netstat -tulnp 2>/dev/null | grep -E ':(53)\s' | grep -v stubby || true)"
+        holder="$(netstat -tulnp 2>/dev/null | grep -E ':(53)[[:space:]]' || true)"
     else
         return 0   # 没有工具，跳过检查
     fi
+    # stubby 自己占着 53 是正常的（我们正要重启它加载新配置），
+    # 只关心别的进程抢了端口。少了这一步会把 stubby 当成冲突方而误报。
+    # 匹配 ss 的 ("stubby",... 与 netstat 的 pid/stubby 两种格式
+    holder="$(printf '%s\n' "$holder" | grep -vE '"stubby"|/stubby([[:space:]]|$)' || true)"
     [[ -n "$holder" ]] && { printf '%s' "$holder"; return 1; }
     return 0
 }
 
 _dot_apply_stubby() {
-    local idx="$1"
+    local idx="$1" holder
+
+    # 端口检查必须放在安装之前。
+    # Debian 的 stubby 包在安装过程中就会自动拉起服务，并用自带的默认配置
+    # 占住 127.0.0.1:53。装完再查，占用者就是它自己，必然误报。
+    if ! holder="$(_dot_port53_free)"; then
+        log_err "127.0.0.1:53 已被占用，stubby 无法启动："
+        printf '%s\n' "$holder" >&2
+        log_info "通常是 dnsmasq / systemd-resolved 占着，请先停用它再试。"
+        return 1
+    fi
 
     if ! have_cmd stubby; then
         log_info "安装 stubby ..."
@@ -474,22 +491,17 @@ _dot_apply_stubby() {
         have_cmd stubby || { log_err "stubby 安装后仍找不到可执行文件"; return 1; }
     fi
 
-    # 先看 53 端口有没有被占，否则 stubby 起了也绑不上
-    local holder
-    if ! holder="$(_dot_port53_free)"; then
-        log_err "127.0.0.1:53 已被占用，stubby 无法启动："
-        printf '%s\n' "$holder" >&2
-        log_info "通常是 dnsmasq / systemd-resolved 占用了，请先停用它。"
-        return 1
-    fi
-
     mkdir -p "$(dirname "$STUBBY_CONF")" || return 1
     _dot_render_stubby "$idx" >"$STUBBY_CONF" || return 1
 
-    systemctl enable --now stubby >/dev/null 2>&1 || {
-        log_err "启动 stubby 服务失败"
+    # 用 enable + restart，不要用 enable --now：
+    # 包安装过程很可能已经带着默认配置把服务拉起来了，而 --now 对已经在跑
+    # 的服务不会重启，我们刚写的配置就加载不进去。
+    systemctl enable stubby >/dev/null 2>&1 || true
+    if ! systemctl restart stubby >/dev/null 2>&1; then
+        log_err "重启 stubby 服务失败"
         return 1
-    }
+    fi
     sleep 1
 
     if ! systemctl is-active --quiet stubby; then
@@ -536,8 +548,22 @@ _dot_rollback() {
 
         *)
             if have_cmd systemctl; then
-                systemctl disable --now stubby >/dev/null 2>&1 || true
+                # 操作前本来就在跑的，恢复运行而不是停掉；
+                # 只有我们带来的才停用。
+                if [[ -n "${DOT_SNAP_STUBBY_ACTIVE:-}" ]]; then
+                    systemctl restart stubby >/dev/null 2>&1 || true
+                else
+                    systemctl disable --now stubby >/dev/null 2>&1 || true
+                fi
             fi
+
+            # 配置也还原，别把人家的 stubby.yml 换掉
+            if [[ -n "${DOT_SNAP_STUBBY_CONF_EXISTED:-}" ]]; then
+                printf '%s' "${DOT_SNAP_STUBBY_CONF:-}" >"$STUBBY_CONF" 2>/dev/null
+            elif [[ -z "${DOT_SNAP_STUBBY_CONF_EXISTED:-}" && -n "${DOT_SNAP_DONE:-}" ]]; then
+                rm -f "$STUBBY_CONF"
+            fi
+
             local real="$RESOLV_CONF"
             [[ -L "$RESOLV_CONF" ]] && real="$(readlink -f "$RESOLV_CONF")"
             printf '%s' "${DOT_SNAP_RESOLV:-}" >"$real" 2>/dev/null
@@ -547,6 +573,8 @@ _dot_rollback() {
 }
 
 _dot_snapshot() {
+    DOT_SNAP_DONE=1
+
     if [[ -e "$RESOLVED_DOT_DROPIN" ]]; then
         DOT_SNAP_DROPIN_EXISTED=1
         DOT_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DOT_DROPIN" 2>/dev/null)"
@@ -554,6 +582,21 @@ _dot_snapshot() {
         DOT_SNAP_DROPIN_EXISTED=''
         DOT_SNAP_DROPIN_CONTENT=''
     fi
+
+    if [[ -e "$STUBBY_CONF" ]]; then
+        DOT_SNAP_STUBBY_CONF_EXISTED=1
+        DOT_SNAP_STUBBY_CONF="$(cat "$STUBBY_CONF" 2>/dev/null)"
+    else
+        DOT_SNAP_STUBBY_CONF_EXISTED=''
+        DOT_SNAP_STUBBY_CONF=''
+    fi
+
+    if have_cmd systemctl && systemctl is-active --quiet stubby 2>/dev/null; then
+        DOT_SNAP_STUBBY_ACTIVE=1
+    else
+        DOT_SNAP_STUBBY_ACTIVE=''
+    fi
+
     DOT_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true)"
 }
 
@@ -594,7 +637,6 @@ net_dot() {
             return 0
         fi
 
-        _dot_snapshot
         if have_cmd systemctl; then
             systemctl disable --now stubby >/dev/null 2>&1 || true
         fi
