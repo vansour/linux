@@ -69,7 +69,8 @@ fi
     printf '# ============================================================\n'
     printf '#  %s  v%s  —— 单文件版（自动生成，请勿直接编辑）\n' "Linux 一键配置脚本" "$_ver_main"
     printf '#\n'
-    printf '#  生成时间: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '#  不写入生成时间：产物需完全可复现，否则 pre-commit 钩子\n'
+    printf '#  每次重建都会产生无意义的 diff。构建时间看 git log。\n'
     printf '#  源码改动请编辑 main.sh / lib/ / modules/，然后运行 bash build.sh\n'
     printf '# ============================================================\n'
     printf 'SINGLE_FILE=1\n'
