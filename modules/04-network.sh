@@ -809,8 +809,8 @@ net.ipv4.tcp_fastopen = 3
 fs.file-max = ${BBR_FILEMAX}
 
 # ---- IPv6（$([[ "$ipv6" == 1 ]] && echo 已禁用 || echo 已启用)）----
-# sysctl 方式只对之后新起的连接与新接口生效，已有的 IPv6 地址不会立刻消失；
-# 要彻底禁用还需在内核命令行加 ipv6.disable=1（需重启）。
+# 只通过这两个 sysctl 设置，不写内核命令行（ipv6.disable=1 那种做法要重启）。
+# 因此只对之后新起的连接与新接口生效，已有的 IPv6 地址不会立刻消失。
 net.ipv6.conf.all.disable_ipv6 = ${ipv6}
 net.ipv6.conf.default.disable_ipv6 = ${ipv6}
 EOF
