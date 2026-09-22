@@ -84,7 +84,7 @@ linux/
 │   ├── 01-system.sh     # 系统信息
 │   ├── 02-update.sh     # 系统更新
 │   ├── 03-tools.sh      # 常用工具
-│   ├── 04-network.sh    # 网络设置（BBR / DNS / DoT）
+│   ├── 04-network.sh    # 网络设置（优化 / DNS / DoT）
 │   ├── 05-user.sh       # 用户管理
 │   └── 06-service.sh    # 服务管理
 └── .shellcheckrc        # shellcheck 配置（多文件 source 架构的误报屏蔽）
