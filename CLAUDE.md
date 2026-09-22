@@ -86,10 +86,19 @@ modules/*.sh         功能模块，按文件名排序载入
 ### 常用命令
 
 ```bash
+git config core.hooksPath .githooks   # 新克隆必须执行一次，启用 pre-commit 钩子
 sudo bash main.sh              # 开发时跑源码版
 bash build.sh                  # 改完源码必须重新打包
 shellcheck main.sh lib/*.sh modules/*.sh build.sh
 ```
+
+### pre-commit 钩子
+
+`.githooks/pre-commit` 会在源码变动时自动重建 `install.sh` 并纳入本次提交，
+打包失败则中止提交。`git commit --no-verify` 可跳过。
+
+构建产物**不写入生成时间**，保证完全可复现 —— 否则钩子每次重建都会产生无意义 diff。
+`build.sh` 采用原子写入：全部自检通过后才落到目标位置，失败时保留原有 `install.sh` 不损坏。
 
 ### 开发约定
 

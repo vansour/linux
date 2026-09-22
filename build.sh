@@ -63,7 +63,14 @@ fi
 
 # ------------------------------------------------------------
 # 生成
+#
+# 先写到临时文件，全部自检通过后才落到 $OUT。直接写 $OUT 的话，
+# 校验失败会在工作区留下一个损坏的 install.sh —— 提交虽然被钩子拦下，
+# 坏产物却还在，容易被后续操作误带上。
 # ------------------------------------------------------------
+_TMP_OUT="$OUT.tmp.$$"
+trap 'rm -f "$_TMP_OUT"; rm -rf "${_isolated:-}"' EXIT
+
 {
     printf '#!/usr/bin/env bash\n'
     printf '# ============================================================\n'
@@ -83,30 +90,29 @@ fi
         printf '# ════════════════════════════════════════════════════════════\n'
         _strip_shebang "$f"
     done
-} >"$OUT"
+} >"$_TMP_OUT"
 
-chmod +x "$OUT"
+chmod +x "$_TMP_OUT"
 
 # ------------------------------------------------------------
-# 打包后自检
+# 打包后自检（全部针对临时文件，失败不污染工作区）
 # ------------------------------------------------------------
-if ! bash -n "$OUT"; then
-    printf '打包结果语法错误: %s\n' "$OUT" >&2
+if ! bash -n "$_TMP_OUT"; then
+    printf '打包结果语法错误，已保留原 %s 不变\n' "$(basename "$OUT")" >&2
     exit 1
 fi
 
-_ver_out="$(bash "$OUT" --version 2>/dev/null || true)"
+_ver_out="$(bash "$_TMP_OUT" --version 2>/dev/null || true)"
 if [[ "$_ver_out" != "$_ver_main" ]]; then
     printf '打包结果 --version 输出异常: 期望 %s，实际 %s\n' "$_ver_main" "${_ver_out:-空}" >&2
     exit 1
 fi
 
-# 隔离验证：把 install.sh 单独复制到空目录运行。
+# 隔离验证：把产物单独复制到空目录运行。
 # 只要它还能正常列出全部模块，就证明确实不依赖 lib/ 和 modules/。
 # （比 grep source 语句可靠：. /etc/os-release 这类正当调用不会被误判）
 _isolated="$(mktemp -d)"
-trap 'rm -rf "$_isolated"' EXIT
-cp "$OUT" "$_isolated/install.sh"
+cp "$_TMP_OUT" "$_isolated/install.sh"
 
 _expected="${#_module_files[@]}"
 _list_out="$(cd "$_isolated" && bash ./install.sh --list 2>&1)" || {
@@ -119,6 +125,12 @@ if [[ "$_registered" != "$_expected" ]]; then
     printf '%s\n' "$_list_out" >&2
     exit 1
 fi
+
+# ------------------------------------------------------------
+# 自检全部通过，此刻才落到目标位置
+# ------------------------------------------------------------
+mv -f "$_TMP_OUT" "$OUT"
+chmod +x "$OUT"
 
 _lines="$(wc -l <"$OUT")"
 _size="$(du -h "$OUT" | cut -f1)"

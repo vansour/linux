@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# ============================================================
+# pre-commit —— 源码改动后自动重新打包 install.sh
+#
+# install.sh 是 build.sh 的产物，但纳入了版本管理（这样 raw 链接
+# 才能一键安装）。忘记重建就会让线上提供旧脚本，在这里兜住。
+#
+# 启用方式（每个克隆都要执行一次，git 不会自动应用钩子）：
+#   git config core.hooksPath .githooks
+#
+# 跳过本次检查：
+#   git commit --no-verify
+# ============================================================
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# ------------------------------------------------------------
+# 会影响到 install.sh 的源文件
+# ------------------------------------------------------------
+SOURCES=(main.sh build.sh)
+shopt -s nullglob
+SOURCES+=(lib/*.sh modules/*.sh)
+shopt -u nullglob
+
+# ------------------------------------------------------------
+# 源文件相对 HEAD 有无改动。用 status 而非 diff，
+# 因为 diff 看不到新增（未跟踪）的模块文件。
+# ------------------------------------------------------------
+source_changed=0
+if [[ -n "$(git status --porcelain -- "${SOURCES[@]}")" ]]; then
+    source_changed=1
+fi
+
+# ------------------------------------------------------------
+# 没人改源码，但 install.sh 自己动了 —— 多半是手改了这个生成文件
+# ------------------------------------------------------------
+if (( ! source_changed )) && [[ -n "$(git status --porcelain -- install.sh)" ]]; then
+    echo "[pre-commit] 警告: install.sh 被直接修改，但源码没有变化。" >&2
+    echo "[pre-commit] 这是生成文件，将按源码重新打包覆盖该改动。" >&2
+    source_changed=1
+fi
+
+if (( ! source_changed )); then
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# 重新打包。build.sh 自带语法检查、版本号一致性校验和隔离运行验证，
+# 它失败说明产物有问题，必须中止提交。
+# ------------------------------------------------------------
+echo "[pre-commit] 检测到源码改动，重新打包 install.sh ..."
+
+if ! build_output="$(bash build.sh 2>&1)"; then
+    echo "[pre-commit] ✗ 打包失败，提交已中止：" >&2
+    printf '%s\n' "$build_output" >&2
+    exit 1
+fi
+
+printf '%s\n' "$build_output"
+
+git add install.sh
+echo "[pre-commit] ✓ install.sh 已重建并加入本次提交"

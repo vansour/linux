@@ -45,6 +45,15 @@ curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh | sudo 
 
 **改完源码记得重新 `bash build.sh`**，否则 `install.sh` 还是旧的。
 
+仓库自带 pre-commit 钩子会自动做这件事，新克隆启用一次即可：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+之后源码有变动时提交，钩子会自动重建 `install.sh` 并纳入本次提交；打包失败则中止提交。
+（`git commit --no-verify` 可跳过）
+
 ### 命令行选项
 
 | 选项 | 说明 |
@@ -65,6 +74,7 @@ linux/
 ├── main.sh              # 入口：参数解析 → 载入库 → 探测系统 → 载入模块 → 主菜单
 ├── build.sh             # 打包：把上面所有文件合成单个 install.sh
 ├── install.sh           # 【自动生成，勿手改】单文件分发版
+├── .githooks/           # pre-commit：源码变动时自动重建 install.sh
 ├── lib/
 │   ├── core.sh          # 颜色 / 日志 / 系统探测 / 包管理抽象 / 交互函数
 │   ├── ui.sh            # 界面渲染：宽字符计算、边框、菜单、标题
