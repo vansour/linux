@@ -1271,17 +1271,20 @@ _dns_rollback() {
     esac
 }
 
+# $(cat) 会吃掉结尾换行，用哨兵字符保住原样，还原前再摘掉
 # 记录现场（存内存，不落备份文件）
 _dns_snapshot() {
     local mech="$1"
     if [[ -e "$RESOLVED_DROPIN" ]]; then
         DNS_SNAP_DROPIN_EXISTED=1
-        DNS_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DROPIN" 2>/dev/null)"
+        DNS_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DROPIN" 2>/dev/null; printf x)"
+        DNS_SNAP_DROPIN_CONTENT="${DNS_SNAP_DROPIN_CONTENT%x}"
     else
         DNS_SNAP_DROPIN_EXISTED=''
         DNS_SNAP_DROPIN_CONTENT=''
     fi
-    DNS_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true)"
+    DNS_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true; printf x)"
+    DNS_SNAP_RESOLV="${DNS_SNAP_RESOLV%x}"
 }
 
 # ============================================================
@@ -1543,13 +1546,15 @@ _dot_snapshot() {
 
     if [[ -e "$RESOLVED_DROPIN" ]]; then
         DOT_SNAP_DROPIN_EXISTED=1
-        DOT_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DROPIN" 2>/dev/null)"
+        DOT_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DROPIN" 2>/dev/null; printf x)"
+        DOT_SNAP_DROPIN_CONTENT="${DOT_SNAP_DROPIN_CONTENT%x}"
     else
         DOT_SNAP_DROPIN_EXISTED=''
         DOT_SNAP_DROPIN_CONTENT=''
     fi
 
-    DOT_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true)"
+    DOT_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true; printf x)"
+    DOT_SNAP_RESOLV="${DOT_SNAP_RESOLV%x}"
 }
 
 # ============================================================
@@ -1702,6 +1707,436 @@ net_dot() {
     module_end
 }
 
+# ============================================================
+# BBR 加速
+#
+# 开 BBR + fq 拥塞控制，按用户给的「带宽 + 延迟」算 BDP 调缓冲区，
+# 并做高并发相关优化。
+# ============================================================
+BBR_CONF="${BBR_CONF:-/etc/sysctl.d/99-linux-toolkit-bbr.conf}"
+SYSCTL_CONF="${SYSCTL_CONF:-/etc/sysctl.conf}"
+SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
+
+# ------------------------------------------------------------
+# 受管参数集合
+#
+# 分两档，用于判断「一个配置文件是不是网络调优文件」：
+#   STRONG —— 只有性能调优才会写的参数，安全加固文件绝不会碰
+#   WEAK   —— 调优和加固都可能写（tcp_syncookies 就同时出现在
+#             Debian 的 10-network-security.conf 里）
+#
+# 判定规则：文件里所有生效的指令都在集合内，且至少有一条 STRONG，
+# 才认定是调优文件。这样 10-network-security.conf（含 rp_filter 等
+# 域外参数）会被完整保留，不会因为一个 tcp_syncookies 就被误删。
+# ------------------------------------------------------------
+BBR_STRONG_PARAMS=(
+    net.ipv4.tcp_congestion_control net.core.default_qdisc
+    net.core.rmem_max net.core.wmem_max
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+    net.core.somaxconn net.core.netdev_max_backlog
+    net.ipv4.tcp_max_syn_backlog net.ipv4.ip_local_port_range
+    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle
+    net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_tw_reuse
+    net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing
+)
+BBR_WEAK_PARAMS=(
+    net.ipv4.tcp_syncookies net.ipv4.tcp_fin_timeout
+)
+
+_bbr_in_list() {
+    local needle="$1"; shift
+    local p
+    for p in "$@"; do [[ "$p" == "$needle" ]] && return 0; done
+    return 1
+}
+
+# 该文件是否是可删除的网络调优配置
+_bbr_is_tuning_file() {
+    local f="$1" line key strong=0 count=0
+
+    [[ -r "$f" ]] || return 1
+
+    while IFS= read -r line; do
+        line="${line%%#*}"                       # 去掉行尾注释
+        line="$(printf '%s' "$line" | tr -d '[:space:]')"
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"
+        [[ "$key" == "$line" ]] && continue      # 没有等号，不是赋值
+
+        if _bbr_in_list "$key" "${BBR_STRONG_PARAMS[@]}"; then
+            strong=1
+        elif ! _bbr_in_list "$key" "${BBR_WEAK_PARAMS[@]}"; then
+            return 1                             # 出现域外参数 → 整个文件不碰
+        fi
+        count=$(( count + 1 ))
+    done <"$f"
+
+    (( count > 0 && strong == 1 ))
+}
+
+# 列出可删除的调优文件。包自带的文件一律跳过
+_bbr_list_conflicts() {
+    local f base
+    shopt -s nullglob
+    for f in "$SYSCTL_D"/*.conf; do
+        _bbr_is_tuning_file "$f" || continue
+        if dpkg -S "$f" >/dev/null 2>&1; then
+            log_debug "跳过包自带文件: $f"
+            continue
+        fi
+        printf '%s\n' "$f"
+    done
+    shopt -u nullglob
+}
+
+# /etc/sysctl.conf 里设置了受管参数的行的行号。
+# 这个文件不能整个删（可能还存着别的设置），只能把这几行注释掉。
+# 它的优先级高于 sysctl.d/，不处理会直接盖掉我们的配置。
+_bbr_list_sysctl_conf_lines() {
+    local line key n=0
+    [[ -r "$SYSCTL_CONF" ]] || return 0
+    while IFS= read -r line; do
+        n=$(( n + 1 ))
+        local stripped="${line%%#*}"
+        stripped="$(printf '%s' "$stripped" | tr -d '[:space:]')"
+        [[ -z "$stripped" ]] && continue
+        key="${stripped%%=*}"
+        [[ "$key" == "$stripped" ]] && continue
+        if _bbr_in_list "$key" "${BBR_STRONG_PARAMS[@]}" \
+           || _bbr_in_list "$key" "${BBR_WEAK_PARAMS[@]}"; then
+            printf '%s\n' "$n"
+        fi
+    done <"$SYSCTL_CONF"
+}
+
+# ------------------------------------------------------------
+# 内核支持
+# ------------------------------------------------------------
+_bbr_supported() {
+    # 内容形如 "reno cubic bbr"，按空白拆成数组逐个比对
+    local avail=()
+    read -ra avail < /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
+    _bbr_in_list bbr ${avail[@]+"${avail[@]}"}
+}
+
+_bbr_ensure_module() {
+    _bbr_supported && return 0
+
+    have_cmd modprobe || return 1
+    modprobe tcp_bbr 2>/dev/null || true
+    _bbr_supported && {
+        # 内核模块形式的需要开机自动加载
+        if [[ -d /etc/modules-load.d ]]; then
+            printf 'tcp_bbr\n' >/etc/modules-load.d/bbr.conf 2>/dev/null || true
+            BBR_WROTE_MODULES_LOAD=1
+        fi
+        return 0
+    }
+    return 1
+}
+
+# ------------------------------------------------------------
+# 按带宽和延迟算参数
+#
+# BDP（带宽延迟积，字节）= 带宽(Mbps) × 延迟(ms) × 125
+#   推导: Mbps → 字节/秒 是 ×1e6/8 = ×125000；ms → 秒 是 ÷1000；
+#         合起来 ×125。这个值就是「填满管道需要多少数据在途」。
+# 套接字缓冲区必须 ≥ BDP，否则接收窗口会成为吞吐瓶颈。
+# ------------------------------------------------------------
+_bbr_calc() {
+    local bw="$1" rtt="$2"
+
+    local bdp=$(( bw * rtt * 125 ))
+    (( bdp < 212992 ))    && bdp=212992        # 地板：不低于内核默认 rmem_max
+    (( bdp > 536870912 )) && bdp=536870912     # 天花板：512MB，避免离谱值
+
+    BBR_BUF="$bdp"
+
+    # tcp_rmem/tcp_wmem 中间那列是初始值，取缓冲的 1/4
+    local def=$(( bdp / 4 ))
+    (( def < 87380 ))   && def=87380
+    (( def > 4194304 )) && def=4194304
+    BBR_DEF="$def"
+
+    # 网卡收包队列随带宽线性放宽（纯上限，不预分配内存）
+    local nback=$(( bw * 64 ))
+    (( nback < 1000 ))   && nback=1000
+    (( nback > 300000 )) && nback=300000
+    BBR_NETDEV_BACKLOG="$nback"
+
+    # fs.file-max 只升不降 —— 有些系统的现值是内核上限哨兵
+    # （9223372036854775807），写小等于把限制调窄了
+    local cur
+    cur="$(sysctl -n fs.file-max 2>/dev/null || echo 0)"
+    local fmax=1048576
+    (( cur > fmax )) && fmax=$cur
+    BBR_FILEMAX="$fmax"
+
+    BBR_BDP_RAW=$(( bw * rtt * 125 ))
+}
+
+_bbr_render() {
+    local bw="$1" rtt="$2"
+    cat <<EOF
+# 由 Linux 一键配置脚本生成，请勿手工编辑
+# 依据: 带宽 ${bw} Mbps，延迟 ${rtt} ms
+# BDP = ${bw} × ${rtt} × 125 = ${BBR_BDP_RAW} 字节（未截断值）
+
+# ---- 拥塞控制 ----
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# ---- 缓冲区（按 BDP 计算，${BBR_BUF} 字节）----
+net.core.rmem_max = ${BBR_BUF}
+net.core.wmem_max = ${BBR_BUF}
+net.ipv4.tcp_rmem = 4096 ${BBR_DEF} ${BBR_BUF}
+net.ipv4.tcp_wmem = 4096 ${BBR_DEF} ${BBR_BUF}
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_mtu_probing = 1
+
+# ---- 高并发 ----
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = ${BBR_NETDEV_BACKLOG}
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_tw_buckets = 65536
+net.ipv4.tcp_fastopen = 3
+fs.file-max = ${BBR_FILEMAX}
+EOF
+}
+
+# ------------------------------------------------------------
+# 应用 / 验证 / 回滚
+# ------------------------------------------------------------
+# 现场备份到临时目录。
+# 不用「变量存内容」的写法：$(cat file) 会吃掉结尾换行，写回时无法还原成
+# 原样（md5 对不上）。cp -a 才是字节级保真。
+_bbr_snapshot() {
+    BBR_SNAP_DIR="$(mktemp -d)"
+    local f
+
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        cp -a "$f" "$BBR_SNAP_DIR/$(basename "$f")" 2>/dev/null || true
+    done < <(_bbr_list_conflicts)
+
+    # 这两个用固定名，不放同一层，避免与上面的 basename 撞名
+    [[ -e "$SYSCTL_CONF" ]] && cp -a "$SYSCTL_CONF" "$BBR_SNAP_DIR/_sysctl_conf" 2>/dev/null
+    [[ -e "$BBR_CONF" ]]    && cp -a "$BBR_CONF"    "$BBR_SNAP_DIR/_ours" 2>/dev/null
+    return 0
+}
+
+_bbr_rollback() {
+    local f
+
+    [[ -n "${BBR_SNAP_DIR:-}" && -d "$BBR_SNAP_DIR" ]] || return 0
+
+    # 还原被删掉的调优文件
+    shopt -s nullglob
+    for f in "$BBR_SNAP_DIR"/*.conf; do
+        cp -a "$f" "$SYSCTL_D/$(basename "$f")" 2>/dev/null || true
+    done
+    shopt -u nullglob
+
+    # 还原 /etc/sysctl.conf
+    [[ -e "$BBR_SNAP_DIR/_sysctl_conf" ]] \
+        && cp -a "$BBR_SNAP_DIR/_sysctl_conf" "$SYSCTL_CONF" 2>/dev/null
+
+    # 还原我们自己的文件（本来没有就删掉）
+    if [[ -e "$BBR_SNAP_DIR/_ours" ]]; then
+        cp -a "$BBR_SNAP_DIR/_ours" "$BBR_CONF" 2>/dev/null
+    else
+        rm -f "$BBR_CONF"
+    fi
+
+    if [[ -n "${BBR_WROTE_MODULES_LOAD:-}" ]]; then
+        rm -f /etc/modules-load.d/bbr.conf
+    fi
+
+    rm -rf "$BBR_SNAP_DIR"
+    BBR_SNAP_DIR=''
+
+    sysctl --system >/dev/null 2>&1 || true
+    return 0
+}
+
+_bbr_verify() {
+    local expect_buf="$1" expect_cc="$2" expect_qdisc="$3"
+    local cc qd rm wm
+
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    qd="$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    rm="$(sysctl -n net.core.rmem_max 2>/dev/null)"
+    wm="$(sysctl -n net.core.wmem_max 2>/dev/null)"
+
+    [[ "$cc" == "$expect_cc" ]] || { printf '拥塞控制算法未生效: 期望 %s，实际 %s\n' "$expect_cc" "$cc"; return 1; }
+    [[ "$qd" == "$expect_qdisc" ]] || { printf '队列规则未生效: 期望 %s，实际 %s\n' "$expect_qdisc" "$qd"; return 1; }
+    [[ "$rm" == "$expect_buf" ]] || { printf 'rmem_max 未生效: 期望 %s，实际 %s\n' "$expect_buf" "$rm"; return 1; }
+    [[ "$wm" == "$expect_buf" ]] || { printf 'wmem_max 未生效: 期望 %s，实际 %s\n' "$expect_buf" "$wm"; return 1; }
+    return 0
+}
+
+# ============================================================
+# BBR 主流程
+# ============================================================
+net_bbr() {
+    require_root
+
+    module_begin "BBR 加速"
+    if ! _bbr_supported; then
+        log_warn "当前内核未提供 bbr，尝试加载内核模块 ..."
+        if ! _bbr_ensure_module; then
+            log_err "内核不支持 BBR（需要 4.9 以上且已编译 tcp_bbr）。"
+            log_info "当前可用算法: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+            module_end
+            return 1
+        fi
+        log_ok "已加载 tcp_bbr 模块"
+    fi
+    ui_kv "内核" "$KERNEL"
+    ui_kv "可用算法" "$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+    ui_kv "当前算法" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    ui_kv "当前队列规则" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    printf '\n'
+    pause
+
+    # ---- 采集输入 ----
+    module_begin "BBR 加速 · 参数"
+    printf '  %s带宽和延迟用来计算 BDP（带宽延迟积），决定缓冲区大小。%s\n' "$C_DIM" "$C_RESET"
+    printf '  %s填错会导致缓冲区过大浪费内存或过小跑不满带宽。%s\n\n' "$C_DIM" "$C_RESET"
+
+    local bw rtt
+    while true; do
+        ask "服务器带宽 (Mbps)" "${BBR_INPUT_BW:-}"
+        bw="$REPLY"
+        [[ "$bw" =~ ^[0-9]+$ ]] && (( bw >= 1 && bw <= 100000 )) && break
+        log_warn "请输入 1-100000 之间的整数（Mbps）"
+    done
+    while true; do
+        ask "网络延迟 (ms)" "${BBR_INPUT_RTT:-}"
+        rtt="$REPLY"
+        [[ "$rtt" =~ ^[0-9]+$ ]] && (( rtt >= 1 && rtt <= 5000 )) && break
+        log_warn "请输入 1-5000 之间的整数（毫秒）"
+    done
+
+    _bbr_calc "$bw" "$rtt"
+
+    # ---- 列出会被删除的配置 ----
+    local victims=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && victims+=("$f")
+    done < <(_bbr_list_conflicts)
+
+    local conf_lines=()
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && conf_lines+=("$n")
+    done < <(_bbr_list_sysctl_conf_lines)
+
+    # ---- 预览 ----
+    module_begin "确认变更"
+    ui_section "计算依据"
+    ui_kv "带宽" "${bw} Mbps"
+    ui_kv "延迟" "${rtt} ms"
+    ui_kv "BDP" "${BBR_BDP_RAW} 字节"
+    ui_kv "缓冲区" "${BBR_BUF} 字节 ($(awk -v b="$BBR_BUF" 'BEGIN{printf "%.1f MB", b/1048576}'))"
+
+    ui_section "将要删除"
+    if (( ${#victims[@]} == 0 )); then
+        printf '  %s(无)%s\n' "$C_DIM" "$C_RESET"
+    else
+        for f in "${victims[@]}"; do
+            printf '  %s-%s %s\n' "$C_RED" "$C_RESET" "$f"
+        done
+    fi
+
+    if (( ${#conf_lines[@]} > 0 )); then
+        printf '\n'
+        ui_section "$SYSCTL_CONF 中将被注释的行"
+        for n in "${conf_lines[@]}"; do
+            printf '  %s#%s %s\n' "$C_YELLOW" "$n" "$(sed -n "${n}p" "$SYSCTL_CONF")"
+        done
+        printf '  %s这个文件优先级高于 sysctl.d/，不处理会直接盖掉新配置。%s\n' "$C_DIM" "$C_RESET"
+    fi
+
+    printf '  %s未列出的文件（README.sysctl、IPv6 设置等）一律保留%s\n' "$C_DIM" "$C_RESET"
+
+    ui_section "将要写入 $BBR_CONF"
+    _bbr_render "$bw" "$rtt" | sed 's/^/  /'
+
+    printf '\n'
+    log_warn "此操作不可撤销，且不会备份原文件。"
+    if ! confirm "确认执行?" n; then
+        log_info "已取消，未做任何修改。"
+        module_end
+        return 0
+    fi
+
+    # ---- 应用 ----
+    module_begin "应用配置"
+    _bbr_snapshot
+
+    local f n i
+    for f in "${victims[@]}"; do
+        if rm -f "$f"; then log_ok "已删除 $f"; else log_err "删除失败: $f"; fi
+    done
+
+    if (( ${#conf_lines[@]} > 0 )); then
+        local tmp
+        tmp="$(mktemp)"
+        awk -v lines="${conf_lines[*]}" '
+            BEGIN { n = split(lines, a, " "); for (i=1;i<=n;i++) skip[a[i]] = 1 }
+            skip[NR] { printf "# [linux-toolkit] 被 BBR 配置覆盖: %s\n", $0; next }
+            { print }
+        ' "$SYSCTL_CONF" >"$tmp" && install -m 0644 "$tmp" "$SYSCTL_CONF"
+        rm -f "$tmp"
+        log_ok "已注释 $SYSCTL_CONF 中 ${#conf_lines[@]} 行冲突设置"
+    fi
+
+    mkdir -p "$(dirname "$BBR_CONF")"
+    if _bbr_render "$bw" "$rtt" >"$BBR_CONF"; then
+        log_ok "已写入 $BBR_CONF"
+    else
+        log_err "写入失败，正在回滚..."
+        _bbr_rollback
+        module_end
+        return 1
+    fi
+
+    # ---- 生效并验证 ----
+    ui_section "加载并验证"
+    sysctl --system >/dev/null 2>&1 || true
+
+    if _bbr_verify "$BBR_BUF" bbr fq; then
+        log_ok "BBR + fq 已启用，参数已生效。"
+        rm -rf "${BBR_SNAP_DIR:-}"      # 已生效，现场快照不再需要
+        BBR_SNAP_DIR=''
+        ui_section "当前状态"
+        ui_kv "拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control)"
+        ui_kv "队列规则" "$(sysctl -n net.core.default_qdisc)"
+        ui_kv "rmem_max" "$(sysctl -n net.core.rmem_max)"
+        ui_kv "wmem_max" "$(sysctl -n net.core.wmem_max)"
+        ui_kv "somaxconn" "$(sysctl -n net.core.somaxconn)"
+        ui_kv "netdev_backlog" "$(sysctl -n net.core.netdev_max_backlog)"
+        log_info "已建立的连接沿用旧算法，新建连接才走 BBR。"
+    else
+        log_err "验证未通过，正在回滚..."
+        _bbr_rollback
+        if _bbr_verify "$(sysctl -n net.core.rmem_max)" "$(sysctl -n net.ipv4.tcp_congestion_control)" "$(sysctl -n net.core.default_qdisc)"; then
+            log_ok "已恢复到变更前状态。"
+        else
+            log_warn "回滚后请手动检查: sysctl -n net.ipv4.tcp_congestion_control"
+        fi
+        module_end
+        return 1
+    fi
+
+    module_end
+}
+
 # ------------------------------------------------------------
 # 其余功能占位
 # ------------------------------------------------------------
@@ -1722,17 +2157,18 @@ net_connectivity() {
 
 menu_network() {
     local items=(
+        "BBR 加速|拥塞控制 + fq，按带宽延迟调优"
         "DNS 设置|Cloudflare / Google / 腾讯 / 阿里"
         "DoT 加密 DNS|DNS over TLS，检查 853 端口"
         "IP 配置|静态 IP / DHCP"
         "代理设置|系统级 / 终端代理"
         "连通测试|延迟 / 测速"
     )
-    local fns=(net_dns net_dot net_ip_config net_proxy net_connectivity)
+    local fns=(net_bbr net_dns net_dot net_ip_config net_proxy net_connectivity)
     run_submenu "网络设置" items fns
 }
 
-register_module "network" "网络设置" "menu_network" "DNS / DoT / IP / 代理"
+register_module "network" "网络设置" "menu_network" "BBR / DNS / DoT / 代理"
 
 
 # ════════════════════════════════════════════════════════════
