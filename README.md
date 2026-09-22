@@ -86,7 +86,8 @@ linux/
 │   ├── 03-tools.sh      # 常用工具（Docker / gh / nginx / 测速）
 │   ├── 04-network.sh    # 网络设置（优化 / DNS / DoT）
 │   ├── 05-user.sh       # 用户管理
-│   └── 06-service.sh    # 服务管理
+│   ├── 06-service.sh    # 服务管理
+│   └── 07-swap.sh       # Swap 管理（添加 / 删除 / swappiness）
 └── .shellcheckrc        # shellcheck 配置（多文件 source 架构的误报屏蔽）
 ```
 
