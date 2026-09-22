@@ -67,6 +67,19 @@ _swap_human_kb() {
     }'
 }
 
+# 大小标签：MB 值放前面，人类可读形式放括号里。
+# 只写「31.3 GB」会和「物理内存 32100 MB」串味 —— 减 1MB 在 GB 的
+# 精度下根本看不出来，容易被读成「少了 1GB」。MB 是精确值，放前面。
+_swap_size_label() {
+    local mb="$1" h
+    h="$(_swap_human_mb "$mb")"
+    if [[ "$h" == "${mb} MB" ]]; then
+        printf '%s' "$h"
+    else
+        printf '%s MB  (%s)' "$mb" "$h"
+    fi
+}
+
 # /proc/swaps 里文件形式的 swap。分区和 zram 都以 /dev/ 开头，天然被排除。
 _swap_active_files() {
     awk 'NR > 1 && $1 ~ /^\// && $1 !~ /^\/dev\// { print $1 }' /proc/swaps 2>/dev/null
@@ -290,7 +303,7 @@ swap_status() {
         ui_kv "物理内存" "读不到"
     fi
     if default_mb="$(_swap_default_mb)"; then
-        ui_kv "建议大小" "${default_mb} MB  (内存 - 1MB)"
+        ui_kv "建议大小" "${default_mb} MB  (内存 ${mem} MB − 1 MB)"
     fi
 
     ui_section "当前生效的 Swap"
@@ -311,7 +324,7 @@ swap_status() {
     ui_section "本模块管理的文件"
     ui_kv "路径" "$SWAP_FILE"
     if fsize="$(_swap_file_mb "$SWAP_FILE")"; then
-        ui_kv "文件" "存在，$(_swap_human_mb "$fsize")"
+        ui_kv "文件" "存在，$(_swap_size_label "$fsize")"
     else
         ui_kv "文件" "不存在"
     fi
@@ -380,7 +393,7 @@ swap_add() {
     module_begin "添加 / 重建 Swap"
     ui_kv "目标文件" "$SWAP_FILE"
     ui_kv "物理内存" "${mem} MB"
-    ui_kv "默认大小" "${default_mb} MB  (内存 - 1MB)"
+    ui_kv "默认大小" "${default_mb} MB  (内存 ${mem} MB − 1 MB)"
     if _swap_is_active "$SWAP_FILE"; then
         ui_kv "当前状态" "已启用，将被关闭并重建"
     elif [[ -f "$SWAP_FILE" ]]; then
@@ -408,7 +421,7 @@ swap_add() {
     module_begin "确认变更"
     ui_section "将创建"
     ui_kv "文件" "$SWAP_FILE"
-    ui_kv "大小" "$(_swap_human_mb "$size_mb")  (${size_mb} MB)"
+    ui_kv "大小" "$(_swap_size_label "$size_mb")"
     ui_kv "swappiness" "$SWAP_SWAPPINESS"
     ui_kv "配置" "$SWAP_SYSCTL_CONF"
     ui_kv "fstab" "$SWAP_FILE none swap sw 0 0"
@@ -509,7 +522,7 @@ swap_add() {
         module_end
         return 1
     fi
-    log_ok "新文件已就绪：$new_file（$(_swap_human_mb "$size_mb")）"
+    log_ok "新文件已就绪：$new_file（$(_swap_size_label "$size_mb")）"
 
     # 到这里才开始动现有的：旧文件改名留作回滚，而不是直接删
     _swap_snapshot "$SWAP_FILE"
@@ -662,16 +675,16 @@ swap_remove() {
             total_mb=$(( total_mb + sz ))
             if [[ -n "${active_flags[i]}" ]]; then
                 printf '  %s-%s %s（%s，启用中，先 swapoff）\n' \
-                    "$C_RED" "$C_RESET" "$c" "$(_swap_human_mb "$sz")"
+                    "$C_RED" "$C_RESET" "$c" "$(_swap_size_label "$sz")"
             else
                 printf '  %s-%s %s（%s，未启用）\n' \
-                    "$C_RED" "$C_RESET" "$c" "$(_swap_human_mb "$sz")"
+                    "$C_RED" "$C_RESET" "$c" "$(_swap_size_label "$sz")"
             fi
         else
             printf '  %s-%s %s（文件不存在，只清理配置）\n' "$C_RED" "$C_RESET" "$c"
         fi
     done
-    (( total_mb > 0 )) && printf '  %s合计 %s%s\n' "$C_DIM" "$(_swap_human_mb "$total_mb")" "$C_RESET"
+    (( total_mb > 0 )) && printf '  %s合计 %s%s\n' "$C_DIM" "$(_swap_size_label "$total_mb")" "$C_RESET"
 
     local lines any_fstab=0
     for c in "${candidates[@]}"; do
