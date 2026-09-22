@@ -1,0 +1,17 @@
+# 编辑器临时文件
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# 系统文件
+.DS_Store
+
+# 运行期产物
+*.log
+
+# 注意：install.sh 是 build.sh 的产物，但有意纳入版本管理——
+# 这样用户可以直接用 raw 链接一键运行：
+#   bash <(curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh)
+# 改完源码务必重新 bash build.sh 再提交。

@@ -1,0 +1,4 @@
+# 本项目是多文件 source 架构：变量在 lib/ 中定义、被 main.sh 或 modules/ 使用，
+# shellcheck 单文件分析看不到跨文件引用，因此大量 SC2034 是误报。
+# SC2120: module_end 的可选参数是提供给模块作者的公开 API。
+disable=SC2034,SC2120
