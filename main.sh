@@ -49,8 +49,8 @@ $APP_NAME  v$APP_VERSION
   sudo bash $SELF_NAME [选项]
 
 一键运行（不需要下载多个文件）:
-  bash <(curl -sL https://你的地址/install.sh)
-  curl -sL https://你的地址/install.sh | sudo bash
+  bash <(curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh)
+  curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh | sudo bash
 
 选项:
   -h, --help        显示本帮助

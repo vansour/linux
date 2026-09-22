@@ -34,10 +34,10 @@ sudo bash install.sh   # 单文件运行
 
 ```bash
 # 推荐：stdin 留给自己，交互最稳
-bash <(curl -sL https://你的地址/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh)
 
 # 也支持：脚本改用 /dev/tty 读键盘，交互同样正常
-curl -sL https://你的地址/install.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh | sudo bash
 ```
 
 > `curl | bash` 能工作是因为所有交互读取都走了 `ui_read`，它在 stdin 被 bash 占用读脚本时

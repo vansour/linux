@@ -2,7 +2,7 @@
 # ============================================================
 #  Linux 一键配置脚本  v0.0.1  —— 单文件版（自动生成，请勿直接编辑）
 #
-#  生成时间: 2026-09-22 14:53:20
+#  生成时间: 2026-09-22 15:00:06
 #  源码改动请编辑 main.sh / lib/ / modules/，然后运行 bash build.sh
 # ============================================================
 SINGLE_FILE=1
@@ -1240,8 +1240,8 @@ $APP_NAME  v$APP_VERSION
   sudo bash $SELF_NAME [选项]
 
 一键运行（不需要下载多个文件）:
-  bash <(curl -sL https://你的地址/install.sh)
-  curl -sL https://你的地址/install.sh | sudo bash
+  bash <(curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh)
+  curl -sL https://raw.githubusercontent.com/vansour/linux/main/install.sh | sudo bash
 
 选项:
   -h, --help        显示本帮助
