@@ -92,6 +92,10 @@ bash build.sh                  # 改完源码必须重新打包
 shellcheck main.sh lib/*.sh modules/*.sh build.sh
 ```
 
+跑 shellcheck **不要加 `-S warning`** —— 那会漏掉 info 级问题（如 SC2015
+的 `A && B || C`）。默认严格度才是完整的。
+```
+
 ### pre-commit 钩子
 
 `.githooks/pre-commit` 会在源码变动时自动重建 `install.sh` 并纳入本次提交，
