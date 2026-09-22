@@ -29,7 +29,10 @@ DNS_NOTES=(
 )
 
 RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
-RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/99-dns.conf"
+# 普通 DNS 与 DoT 共用同一个 drop-in：两者都在配置 systemd-resolved，
+# 拆成两个文件的话，切回普通 DNS 时旧的 DoT 文件还在，DNSOverTLS=yes
+# 会继续生效 —— 以为关了其实没关。
+RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/99-linux-toolkit.conf"
 DNS_PROBE_NAME="${DNS_PROBE_NAME:-example.com}"
 
 # ============================================================
@@ -341,8 +344,6 @@ DOT_SNI=(
     "dns.alidns.com"
 )
 
-STUBBY_CONF="/etc/stubby/stubby.yml"
-RESOLVED_DOT_DROPIN="/etc/systemd/resolved.conf.d/99-dot.conf"
 
 # ------------------------------------------------------------
 # 检查 DoT 端点的 853 端口
@@ -364,64 +365,37 @@ _dot_check() {
 }
 
 # ------------------------------------------------------------
-# 选择后端：优先 systemd-resolved，缺失则用 stubby
+# 后端：只用 systemd-resolved
+#
+# 比过 stubby：后者要装 7 个包共 3.4MB，还多一个常驻守护进程；
+# systemd-resolved 只多装 1 个包（916KB，依赖 systemd/libc/libssl/dbus
+# 基本都已存在），配置就是一个 drop-in，诊断靠 resolvectl。
+#
+# 代价是它必须在 systemd 上跑。非 systemd 系统（Alpine / Devuan / 部分
+# 容器）DoT 直接不可用 —— 这里明确告知，不做静默降级。
 # ------------------------------------------------------------
 _dot_backend() {
-    if have_cmd resolvectl && systemctl cat systemd-resolved.service >/dev/null 2>&1; then
-        printf 'resolved'
+    if [[ ! -d /run/systemd/system ]] || ! have_cmd systemctl; then
+        printf 'unsupported'
+    elif have_cmd resolvectl; then
+        printf 'resolved'          # 已装，零安装
     else
-        printf 'stubby'
+        printf 'resolved-install'  # 没装但能装
     fi
 }
 
 _dot_backend_label() {
     case "$1" in
-        resolved) printf 'systemd-resolved 内置 DoT（无需额外安装）' ;;
-        *)        printf 'stubby（需要安装并常驻）' ;;
+        resolved)         printf 'systemd-resolved（已安装，零安装）' ;;
+        resolved-install) printf 'systemd-resolved（将自动安装，约 916KB）' ;;
+        *)                printf '不可用' ;;
     esac
 }
 
 # 当前是否已启用 DoT
 _dot_is_enabled() {
-    if [[ -s "$RESOLVED_DOT_DROPIN" ]] && grep -qE '^\s*DNSOverTLS\s*=\s*yes' "$RESOLVED_DOT_DROPIN" 2>/dev/null; then
-        return 0
-    fi
-    # stubby 在跑还不够 —— Debian 的包安装完就会带着默认配置自启动
-    # （默认上游是 Sinodun 的测试服务器）。必须确认跑的是我们生成的配置。
-    if have_cmd systemctl && systemctl is-active --quiet stubby 2>/dev/null \
-       && grep -q '由 Linux 一键配置脚本生成' "$STUBBY_CONF" 2>/dev/null; then
-        return 0
-    fi
-    return 1
-}
-
-# ------------------------------------------------------------
-# stubby 配置生成
-# ------------------------------------------------------------
-_dot_render_stubby() {
-    local idx="$1" ip
-
-    cat <<'YAML'
-# 由 Linux 一键配置脚本生成，请勿手工编辑
-resolution_type: GETDNS_RESOLUTION_STUB
-dns_transport_list:
-  - GETDNS_TRANSPORT_TLS
-# 严格模式：只走 TLS，绝不回退到明文 DNS
-tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
-tls_query_padding_blocksize: 128
-edns_client_subnet_private: 1
-round_robin_upstreams: 1
-idle_timeout: 10000
-# 只监听本地回环，不对外提供服务
-listen_addresses:
-  - 127.0.0.1
-YAML
-
-    printf 'upstream_recursive_servers:\n'
-    for ip in ${DOT_IPS[idx]}; do
-        printf '  - address_data: %s\n' "$ip"
-        printf '    tls_auth_name: "%s"\n' "${DOT_SNI[idx]}"
-    done
+    [[ -s "$RESOLVED_DROPIN" ]] \
+        && grep -qE '^\s*DNSOverTLS\s*=\s*yes' "$RESOLVED_DROPIN" 2>/dev/null
 }
 
 # ------------------------------------------------------------
@@ -430,171 +404,83 @@ YAML
 _dot_apply_resolved() {
     local idx="$1" ip dns_list=''
 
+    # Debian 默认不装 systemd-resolved，需要时补上
+    if ! have_cmd resolvectl; then
+        log_info "安装 systemd-resolved ..."
+        pkg_refresh >/dev/null 2>&1 || true
+        if ! pkg_install systemd-resolved; then
+            log_err "systemd-resolved 安装失败"
+            return 1
+        fi
+        if ! have_cmd resolvectl; then
+            log_err "安装后仍找不到 resolvectl，无法继续"
+            return 1
+        fi
+        DOT_INSTALLED_RESOLVED=1
+    fi
+
     for ip in ${DOT_IPS[idx]}; do
         # IP#主机名 让 resolved 用该主机名校验证书
         dns_list+="${ip}#${DOT_SNI[idx]} "
     done
 
-    mkdir -p "$(dirname "$RESOLVED_DOT_DROPIN")" || return 1
+    mkdir -p "$(dirname "$RESOLVED_DROPIN")" || return 1
     {
         printf '# 由 Linux 一键配置脚本生成\n'
         printf '[Resolve]\n'
         printf 'DNS=%s\n' "${dns_list% }"
         printf 'DNSOverTLS=yes\n'
-    } >"$RESOLVED_DOT_DROPIN" || return 1
-
-    systemctl restart systemd-resolved 2>/dev/null || {
-        log_err "重启 systemd-resolved 失败"
-        return 1
-    }
-    return 0
-}
-
-# 检查 127.0.0.1:53 是否被别的程序占着（stubby 起不来通常是这个原因）
-_dot_port53_free() {
-    local holder
-    if have_cmd ss; then
-        holder="$(ss -tulnpH 'sport = :53' 2>/dev/null || true)"
-    elif have_cmd netstat; then
-        holder="$(netstat -tulnp 2>/dev/null | grep -E ':(53)[[:space:]]' || true)"
-    else
-        return 0   # 没有工具，跳过检查
-    fi
-    # stubby 自己占着 53 是正常的（我们正要重启它加载新配置），
-    # 只关心别的进程抢了端口。少了这一步会把 stubby 当成冲突方而误报。
-    # 匹配 ss 的 ("stubby",... 与 netstat 的 pid/stubby 两种格式
-    holder="$(printf '%s\n' "$holder" | grep -vE '"stubby"|/stubby([[:space:]]|$)' || true)"
-    [[ -n "$holder" ]] && { printf '%s' "$holder"; return 1; }
-    return 0
-}
-
-_dot_apply_stubby() {
-    local idx="$1" holder
-
-    # 端口检查必须放在安装之前。
-    # Debian 的 stubby 包在安装过程中就会自动拉起服务，并用自带的默认配置
-    # 占住 127.0.0.1:53。装完再查，占用者就是它自己，必然误报。
-    if ! holder="$(_dot_port53_free)"; then
-        log_err "127.0.0.1:53 已被占用，stubby 无法启动："
-        printf '%s\n' "$holder" >&2
-        log_info "通常是 dnsmasq / systemd-resolved 占着，请先停用它再试。"
-        return 1
-    fi
-
-    if ! have_cmd stubby; then
-        log_info "安装 stubby ..."
-        pkg_refresh >/dev/null 2>&1 || true
-        if ! pkg_install stubby; then
-            log_err "stubby 安装失败"
-            return 1
-        fi
-        have_cmd stubby || { log_err "stubby 安装后仍找不到可执行文件"; return 1; }
-    fi
-
-    mkdir -p "$(dirname "$STUBBY_CONF")" || return 1
-    _dot_render_stubby "$idx" >"$STUBBY_CONF" || return 1
+    } >"$RESOLVED_DROPIN" || return 1
 
     # 用 enable + restart，不要用 enable --now：
     # 包安装过程很可能已经带着默认配置把服务拉起来了，而 --now 对已经在跑
-    # 的服务不会重启，我们刚写的配置就加载不进去。
-    systemctl enable stubby >/dev/null 2>&1 || true
-    if ! systemctl restart stubby >/dev/null 2>&1; then
-        log_err "重启 stubby 服务失败"
+    # 的服务不会重启，刚写的 drop-in 就加载不进去。
+    systemctl enable systemd-resolved >/dev/null 2>&1 || true
+    if ! systemctl restart systemd-resolved 2>/dev/null; then
+        log_err "重启 systemd-resolved 失败"
         return 1
     fi
-    sleep 1
-
-    if ! systemctl is-active --quiet stubby; then
-        log_err "stubby 未能保持运行，检查: journalctl -u stubby -n 20"
-        return 1
-    fi
-
-    # 把系统解析指到 stubby
-    local real="$RESOLV_CONF"
-    [[ -L "$RESOLV_CONF" ]] && real="$(readlink -f "$RESOLV_CONF")"
-    {
-        printf '# 由 Linux 一键配置脚本生成（指向本机 stubby，经 TLS 转发）\n'
-        printf 'nameserver 127.0.0.1\n'
-    } >"$real" || return 1
-
     return 0
-}
-
-_dot_apply() {
-    local backend="$1" idx="$2"
-    case "$backend" in
-        resolved) _dot_apply_resolved "$idx" ;;
-        *)        _dot_apply_stubby "$idx" ;;
-    esac
 }
 
 # ------------------------------------------------------------
 # 回滚
 # ------------------------------------------------------------
 _dot_rollback() {
-    local backend="$1"
+    # 先撤掉我们的 drop-in
+    if [[ -n "${DOT_SNAP_DROPIN_EXISTED:-}" ]]; then
+        printf '%s' "${DOT_SNAP_DROPIN_CONTENT:-}" >"$RESOLVED_DROPIN" 2>/dev/null
+    else
+        rm -f "$RESOLVED_DROPIN"
+    fi
 
-    case "$backend" in
-        resolved)
-            if [[ -n "${DOT_SNAP_DROPIN_EXISTED:-}" ]]; then
-                printf '%s' "${DOT_SNAP_DROPIN_CONTENT:-}" >"$RESOLVED_DOT_DROPIN" 2>/dev/null
-            else
-                rm -f "$RESOLVED_DOT_DROPIN"
-            fi
-            if have_cmd systemctl; then
-                systemctl restart systemd-resolved 2>/dev/null || true
-            fi
-            ;;
-
-        *)
-            if have_cmd systemctl; then
-                # 操作前本来就在跑的，恢复运行而不是停掉；
-                # 只有我们带来的才停用。
-                if [[ -n "${DOT_SNAP_STUBBY_ACTIVE:-}" ]]; then
-                    systemctl restart stubby >/dev/null 2>&1 || true
-                else
-                    systemctl disable --now stubby >/dev/null 2>&1 || true
-                fi
-            fi
-
-            # 配置也还原，别把人家的 stubby.yml 换掉
-            if [[ -n "${DOT_SNAP_STUBBY_CONF_EXISTED:-}" ]]; then
-                printf '%s' "${DOT_SNAP_STUBBY_CONF:-}" >"$STUBBY_CONF" 2>/dev/null
-            elif [[ -z "${DOT_SNAP_STUBBY_CONF_EXISTED:-}" && -n "${DOT_SNAP_DONE:-}" ]]; then
-                rm -f "$STUBBY_CONF"
-            fi
-
-            local real="$RESOLV_CONF"
-            [[ -L "$RESOLV_CONF" ]] && real="$(readlink -f "$RESOLV_CONF")"
-            printf '%s' "${DOT_SNAP_RESOLV:-}" >"$real" 2>/dev/null
-            ;;
-    esac
+    if [[ -n "${DOT_INSTALLED_RESOLVED:-}" ]]; then
+        # systemd-resolved 是本次装上的：停掉，并把 /etc/resolv.conf 还原成
+        # 普通文件。装包时它的 postinst 会把 resolv.conf 换成指向 stub 的
+        # 符号链接，不还原的话系统解析路径就永久改变了。
+        if have_cmd systemctl; then
+            systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+        fi
+        rm -f "$RESOLV_CONF"
+        printf '%s' "${DOT_SNAP_RESOLV:-}" >"$RESOLV_CONF" 2>/dev/null
+    else
+        # 本来就有的，重启一下让它回到旧配置即可
+        if have_cmd systemctl; then
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        fi
+    fi
     return 0
 }
 
 _dot_snapshot() {
-    DOT_SNAP_DONE=1
+    DOT_INSTALLED_RESOLVED=''
 
-    if [[ -e "$RESOLVED_DOT_DROPIN" ]]; then
+    if [[ -e "$RESOLVED_DROPIN" ]]; then
         DOT_SNAP_DROPIN_EXISTED=1
-        DOT_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DOT_DROPIN" 2>/dev/null)"
+        DOT_SNAP_DROPIN_CONTENT="$(cat "$RESOLVED_DROPIN" 2>/dev/null)"
     else
         DOT_SNAP_DROPIN_EXISTED=''
         DOT_SNAP_DROPIN_CONTENT=''
-    fi
-
-    if [[ -e "$STUBBY_CONF" ]]; then
-        DOT_SNAP_STUBBY_CONF_EXISTED=1
-        DOT_SNAP_STUBBY_CONF="$(cat "$STUBBY_CONF" 2>/dev/null)"
-    else
-        DOT_SNAP_STUBBY_CONF_EXISTED=''
-        DOT_SNAP_STUBBY_CONF=''
-    fi
-
-    if have_cmd systemctl && systemctl is-active --quiet stubby 2>/dev/null; then
-        DOT_SNAP_STUBBY_ACTIVE=1
-    else
-        DOT_SNAP_STUBBY_ACTIVE=''
     fi
 
     DOT_SNAP_RESOLV="$(cat "$RESOLV_CONF" 2>/dev/null || true)"
@@ -608,6 +494,16 @@ net_dot() {
 
     local backend
     backend="$(_dot_backend)"
+
+    # 非 systemd 系统上不做静默降级：直接讲清楚为什么不可用
+    if [[ "$backend" == "unsupported" ]]; then
+        module_begin "DoT 加密 DNS"
+        log_err "当前系统不支持 DoT：本功能依赖 systemd-resolved。"
+        log_info "未检出 systemd（/run/systemd/system 不存在）。"
+        log_info "非 systemd 系统（Alpine / Devuan / 部分容器）请用 stubby 等专用 DoT 转发器。"
+        module_end
+        return 1
+    fi
 
     local items=() i
     for (( i=0; i<${#DNS_NAMES[@]}; i++ )); do
@@ -637,10 +533,7 @@ net_dot() {
             return 0
         fi
 
-        if have_cmd systemctl; then
-            systemctl disable --now stubby >/dev/null 2>&1 || true
-        fi
-        rm -f "$RESOLVED_DOT_DROPIN"
+        rm -f "$RESOLVED_DROPIN"
         if have_cmd systemctl; then
             systemctl restart systemd-resolved 2>/dev/null || true
         fi
@@ -708,9 +601,9 @@ net_dot() {
     module_begin "启用 DoT"
     _dot_snapshot
 
-    if ! _dot_apply "$backend" "$idx"; then
+    if ! _dot_apply_resolved "$idx"; then
         log_err "启用失败，正在回滚..."
-        _dot_rollback "$backend"
+        _dot_rollback
         module_end
         return 1
     fi
@@ -727,10 +620,10 @@ net_dot() {
     if (( ok )); then
         log_ok "DoT 已启用，「${DNS_NAMES[idx]}」的查询全程加密。"
         log_info "验证加密生效: resolvectl status | grep DNSOverTLS"
-        log_info "（stubby 后端可看: journalctl -u stubby -n 20）"
+        log_info "查看详情: resolvectl status"
     else
         log_err "启用后无法解析域名，正在自动回滚..."
-        _dot_rollback "$backend"
+        _dot_rollback
         if _dns_probe_system; then
             log_ok "已恢复到启用前的配置，系统解析正常。"
         else
