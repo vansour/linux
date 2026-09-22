@@ -141,10 +141,13 @@ ui_section() {
     printf '\n%s▎%s %s%s%s\n' "$C_BBLUE" "$C_RESET" "$C_BOLD" "$1" "$C_RESET"
 }
 
-# 成功 / 失败 / 提示行
+# 键值行。
+# 不能用 printf 的 %-14s 补齐 —— 它按字符数算，中文是双宽字符，
+# 「管理方式」(4字/8列) 和「当前 DNS」(6字/8列) 会被补成不同宽度。
+# 必须按显示宽度补空格才对得齐。
 ui_kv() {
-    local k="$1" v="$2"
-    printf '  %s%-14s%s %s\n' "$C_DIM" "$k" "$C_RESET" "$v"
+    local k="$1" v="$2" width="${3:-14}"
+    printf '  %s%s%s %s\n' "$C_DIM" "$(_pad_right "$k" "$width")" "$C_RESET" "$v"
 }
 
 # ------------------------------------------------------------
