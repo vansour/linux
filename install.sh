@@ -1433,12 +1433,46 @@ _apt_repo_install() {
     return 0
 }
 
+# 按脚本自己声明的 shebang 选解释器。
+#
+# 不能一律用 sh：Debian 的 /bin/sh 是 dash，而厂商脚本基本都是 bash 脚本
+# （packagecloud 的脚本第 60 行是 [[ ( -z "$os" ) && ( -z "$dist" ) ]]，
+# dash 直接报 "Syntax error: word unexpected"）。厂商给出的安装命令也都是
+# curl ... | sudo bash，跟着 shebang 走才和它们一致。
+#
+# 认不出 shebang、或解释器不在时退回 sh。
+_script_interpreter() {
+    local file="$1" line rest interp parts
+
+    IFS= read -r line <"$file" 2>/dev/null || true
+    [[ "$line" == '#!'* ]] || { printf 'sh'; return; }
+
+    rest="${line#\#!}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"     # 去掉 #! 之后的前导空白
+    read -ra parts <<<"$rest"
+    interp="${parts[0]:-}"
+
+    # #!/usr/bin/env bash → 取 env 后面的那个命令名
+    if [[ "${interp##*/}" == "env" && ${#parts[@]} -gt 1 ]]; then
+        interp="${parts[1]}"
+    fi
+
+    if [[ "$interp" == /* ]]; then
+        [[ -x "$interp" ]] && { printf '%s' "$interp"; return; }
+    elif [[ -n "$interp" ]] && have_cmd "$interp"; then
+        printf '%s' "$interp"
+        return
+    fi
+
+    printf 'sh'
+}
+
 # 下载并执行厂商提供的官方安装脚本。
 # 先落盘再执行，而不是 curl | sh —— 这样能检查下载是否成功、
 # 内容是否为空，执行失败也能拿到真实退出码。
 _run_official_script() {
     local url="$1"
-    local tmp rc=0
+    local tmp rc=0 interp
 
     tmp="$(mktemp)"
     log_info "下载官方脚本: $url"
@@ -1458,8 +1492,9 @@ _run_official_script() {
         return 1
     fi
 
-    log_info "执行中（输出可能较长）..."
-    sh "$tmp" || rc=$?
+    interp="$(_script_interpreter "$tmp")"
+    log_info "执行中（解释器 ${interp##*/}，输出可能较长）..."
+    "$interp" "$tmp" || rc=$?
     rm -f "$tmp"
 
     if (( rc != 0 )); then
@@ -1699,7 +1734,13 @@ tools_speedtest() {
     printf '  %s之后从这里安装 speedtest 包。%s\n' "$C_DIM" "$C_RESET"
 
     printf '\n'
-    if ! confirm "确认安装?" n; then
+    if _tool_installed speedtest \
+       && ! confirm "speedtest 已安装，继续会重新添加官方源并升级。继续?" n; then
+        log_info "已取消。"
+        module_end
+        return 0
+    fi
+    if ! _tool_installed speedtest && ! confirm "确认安装?" n; then
         log_info "已取消。"
         module_end
         return 0
