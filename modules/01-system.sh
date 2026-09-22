@@ -79,7 +79,7 @@ _cpu_cores() {
     ' /proc/cpuinfo 2>/dev/null)"
     [[ -z "$physical" || "$physical" == 0 ]] && physical="$logical"
 
-    # 同上，供 read 消费
+    # 输出「物理核 逻辑核」两个字段，供调用方 read 消费
     printf '%s %s\n' "$physical" "$logical"
 }
 
@@ -264,7 +264,7 @@ sys_disk() {
 # 4) 网络接口
 # ============================================================
 sys_network_iface() {
-    local d dev state addrs
+    local d dev addrs
 
     ui_section "网卡"
     if ! have_cmd ip; then

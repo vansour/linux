@@ -74,7 +74,18 @@ parse_args() {
             -l|--list)    LIST_ONLY=1 ;;
             -d|--debug)   LOG_LEVEL="debug" ;;
             --no-color)   NO_COLOR_OPT=1; export NO_COLOR=1 ;;
-            --log)        shift; LOG_FILE="${1:-}" ;;
+            --log)
+                # 必须检查缺值：不检查的话下面的 shift 会越界，
+                # 而 LOG_FILE 变成空串等于静默关闭日志（_log_write 对空值直接返回），
+                # 用户以为在记日志，实际什么都没记。
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    printf '选项 --log 需要一个文件路径参数\n\n' >&2
+                    usage
+                    exit 2
+                fi
+                LOG_FILE="$1"
+                ;;
             *)            printf '未知参数: %s\n\n' "$1" >&2; usage; exit 2 ;;
         esac
         shift
@@ -105,8 +116,11 @@ load_libs() {
 # 前置检查
 # ------------------------------------------------------------
 preflight() {
-    if (( BASH_VERSINFO[0] < 4 )); then
-        printf '需要 bash 4.0 以上版本，当前为 %s\n' "$BASH_VERSION" >&2
+    # 实际门槛是 4.3：ui_menu / run_submenu 用了 nameref（local -n），
+    # 那是 bash 4.3 才有的特性。写着 4.0 会让 4.0~4.2 的系统通过检查后
+    # 在打开菜单时才报错，不如在这里直接拦下。
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        printf '需要 bash 4.3 以上版本，当前为 %s\n' "$BASH_VERSION" >&2
         exit 1
     fi
     if (( ! SINGLE_FILE )) && [[ ! -d "$MODULES_DIR" ]]; then
@@ -127,6 +141,8 @@ preflight() {
 main() {
     parse_args "$@"
     load_libs
+    # 菜单对齐依赖 UTF-8 charmap，越早修正越好（--list 也要用）
+    _ensure_utf8_locale || log_debug "无可用 UTF-8 locale，中文对齐可能不准"
     preflight
 
     detect_system
@@ -140,7 +156,10 @@ main() {
         printf '已注册 %d 个模块:\n' "${#MAIN_ITEMS[@]}"
         local i
         for (( i=0; i<${#MAIN_ITEMS[@]}; i++ )); do
-            printf '  %2d) %-16s %s\n' $(( i + 1 )) "${MAIN_ITEMS[i]%%|*}" "${MAIN_ITEMS[i]#*|}"
+            # 用 _pad_right 而不是 printf 的 %-16s：后者按字符数补齐，
+            # 汉字是双宽字符，标题长度一变说明列就错开
+            printf '  %2d) %s %s\n' $(( i + 1 )) \
+                "$(_pad_right "${MAIN_ITEMS[i]%%|*}" 16)" "${MAIN_ITEMS[i]#*|}"
         done
         exit 0
     fi

@@ -529,8 +529,13 @@ net_dot() {
 
     # ---- 关闭 DoT ----
     if (( choice == ${#DNS_NAMES[@]} )); then
+        local mech
+        mech="$(_dns_mechanism)"
+
         module_begin "关闭 DoT"
         ui_kv "实现方式" "$(_dot_backend_label "$backend")"
+        ui_kv "DNS 管理方式" "$(_dns_mechanism_label "$mech")"
+        ui_kv "关闭后 DNS" "${DNS_IPS[0]}（明文）"
         printf '\n'
         if ! confirm "确认关闭 DoT，恢复明文 DNS?" n; then
             log_info "已取消。"
@@ -538,21 +543,49 @@ net_dot() {
             return 0
         fi
 
+        # 恢复明文 DNS 必须走机制分发：resolved 场景下 /etc/resolv.conf 是
+        # 指向它自己生成的 stub 的符号链接，往里写 nameserver 会被立刻重写
+        # 成 127.0.0.53，真正决定上游的是 drop-in。绕开机制直接写文件，
+        # 等于写完就被丢弃，对外却报告「已恢复为明文 DNS」。
+        #
+        # 两套快照都要存：_dot_* 管 drop-in，_dns_* 管 resolv.conf 那条链路，
+        # 它们覆盖的文件不同，缺一个回滚就不完整。
+        _dot_snapshot
+        _dns_snapshot "$mech"
+
+        module_begin "关闭 DoT"
         rm -f "$RESOLVED_DROPIN"
-        if have_cmd systemctl; then
-            systemctl restart systemd-resolved 2>/dev/null || true
+
+        if ! _dns_apply "$mech" "${DNS_IPS[0]}"; then
+            log_err "恢复明文 DNS 失败，正在回滚..."
+            _dot_rollback
+            _dns_rollback "$mech"
+            module_end
+            return 1
         fi
 
-        # 恢复成普通 DNS（取第一个服务商的明文地址）
-        local real="$RESOLV_CONF"
-        [[ -L "$RESOLV_CONF" ]] && real="$(readlink -f "$RESOLV_CONF")"
-        {
-            printf '# 由 Linux 一键配置脚本生成\n'
-            local ip
-            for ip in ${DNS_IPS[0]}; do printf 'nameserver %s\n' "$ip"; done
-        } >"$real"
+        ui_section "验证解析"
+        local ok=0
+        for (( i=0; i<10; i++ )); do
+            _dns_probe_system && { ok=1; break; }
+            sleep 0.5
+        done
 
-        log_ok "DoT 已关闭，DNS 恢复为明文 ${DNS_IPS[0]}"
+        if (( ok )); then
+            log_ok "DoT 已关闭，DNS 恢复为明文 ${DNS_IPS[0]}。"
+        else
+            log_err "关闭后无法解析域名，正在恢复到关闭前的状态..."
+            _dot_rollback
+            _dns_rollback "$mech"
+            if _dns_probe_system; then
+                log_ok "已回到关闭前的配置，DoT 仍然可用。"
+            else
+                log_err "回滚后仍无法解析，请手动检查 $RESOLV_CONF 与 $RESOLVED_DROPIN"
+            fi
+            module_end
+            return 1
+        fi
+
         module_end
         return 0
     fi
@@ -872,6 +905,32 @@ _net_rollback() {
     return 0
 }
 
+# ------------------------------------------------------------
+# 中断保护
+#
+# 全新部署的执行窗口是「快照 → 删光 sysctl.d → 写新配置 → 加载 → 验证」。
+# 中途被 Ctrl-C 或 SSH 断线打断时，回滚代码根本轮不到执行：配置已经删了，
+# 快照还躺在没人知道路径的 /tmp 目录里。所以在这个窗口内挂信号处理，
+# 收到信号先还原现场再退出。
+#
+# 快照还没建立时（_net_rollback 会自行判空返回）触发也是安全的。
+# ------------------------------------------------------------
+_net_arm_trap() {
+    trap '_net_on_interrupt' INT TERM HUP
+}
+
+_net_disarm_trap() {
+    trap - INT TERM HUP
+}
+
+_net_on_interrupt() {
+    printf '\n'
+    log_warn "收到中断信号，正在还原网络配置..."
+    _net_rollback
+    log_info "已恢复到变更前的配置。"
+    exit 130
+}
+
 _net_verify() {
     local expect_buf="$1" expect_ipv6="$2"
     local cc qd rm wm v6
@@ -1008,6 +1067,7 @@ net_deploy() {
     # ---- 应用 ----
     module_begin "应用配置"
     _net_snapshot
+    _net_arm_trap      # 从这里开始删改配置，直到验证结束都要防中断
 
     local f n
     for f in "${victims[@]}"; do
@@ -1031,6 +1091,7 @@ net_deploy() {
         log_ok "已写入 $NET_CONF"
     else
         log_err "写入失败，正在回滚..."
+        _net_disarm_trap
         _net_rollback
         module_end
         return 1
@@ -1042,6 +1103,7 @@ net_deploy() {
 
     if _net_verify "$BBR_BUF" "$ipv6"; then
         log_ok "网络优化已生效。"
+        _net_disarm_trap
         rm -rf "${NET_SNAP_DIR:-}"      # 已生效，现场快照不再需要
         NET_SNAP_DIR=''
 
@@ -1056,6 +1118,7 @@ net_deploy() {
         log_info "已建立的连接沿用旧算法，新建连接才走 BBR。"
     else
         log_err "验证未通过，正在回滚..."
+        _net_disarm_trap
         _net_rollback
         log_warn "回滚后请手动检查: sysctl -n net.ipv4.tcp_congestion_control"
         module_end

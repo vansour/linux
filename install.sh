@@ -69,6 +69,36 @@ die()       { log_err "$*"; exit 1; }
 # ------------------------------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ------------------------------------------------------------
+# 保证 charmap 是 UTF-8
+#
+# 显示宽度计算依赖 locale：在 C / POSIX locale 下 bash 的 ${#str} 与
+# ${str:i:1} 都按字节走，一个汉字会被算成 3 列而不是 2 列，两列菜单
+# 的补白随之算错、整体错位。LC_ALL=C sudo bash install.sh 就会踩到。
+#
+# 优先只改 LC_CTYPE：不动 LC_MESSAGES，程序输出的语言不受影响。
+# LC_ALL 一旦被设成非 UTF-8 就会盖掉 LC_CTYPE，这时只能连它一起改。
+# C.utf8 是部分发行版的拼法，两个都试一遍。
+# ------------------------------------------------------------
+_ensure_utf8_locale() {
+    have_cmd locale || return 0
+    [[ "$(locale charmap 2>/dev/null)" == "UTF-8" ]] && return 0
+
+    local cand
+    for cand in C.UTF-8 C.utf8; do
+        if [[ -z "${LC_ALL:-}" ]] \
+           && [[ "$(LC_CTYPE="$cand" locale charmap 2>/dev/null)" == "UTF-8" ]]; then
+            export LC_CTYPE="$cand"
+            return 0
+        fi
+        if [[ "$(LC_ALL="$cand" locale charmap 2>/dev/null)" == "UTF-8" ]]; then
+            export LC_ALL="$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
 # is_tty: stdin 是终端才允许交互
@@ -247,10 +277,12 @@ BOX_H='═'  BOX_V='║'  BOX_ML='╠' BOX_MR='╣'
 BOX_L='─'  BOX_DOT='·'
 
 UI_CHOICE=-1          # ui_menu 的返回值：选项下标(0起)，-1 表示返回/退出
-UI_MENU_WIDTH=${UI_MENU_WIDTH:-0}
 
 # ------------------------------------------------------------
 # 宽度计算：中日韩字符占 2 列，其余占 1 列
+#
+# 依赖 UTF-8 charmap —— C locale 下 ${#str} 和 ${str:i:1} 按字节走，
+# 汉字会计成 3 列。启动时由 core.sh 的 _ensure_utf8_locale 兜住。
 # ------------------------------------------------------------
 _str_width() {
     local str="$1" width=0 i ch code n
@@ -389,42 +421,31 @@ ui_kv() {
 #   ui_menu <标题> <选项数组名> [返回项文案]
 #   选项文案格式支持 "标题|说明"，说明以暗色显示
 #   结果写入全局 UI_CHOICE (0 起下标)，选了返回项则为 -1
+#
+# 一律单列，一项一行。双列要在固定列宽里塞下中英混排的「标题 + 说明」，
+# 说明稍长就会撑破列宽把右边一列顶歪（80 列终端下必然发生），
+# 宽度算错时还会整体错位 —— 单列没有这个约束。
 # ------------------------------------------------------------
 ui_menu() {
     local title="$1" arr_name="$2" back_label="${3:-← 返回}"
     local -n _items="$arr_name"
     local count=${#_items[@]}
-    local i label desc w cols col_w rows r c idx
+    local i label desc cell
 
     UI_CHOICE=-1
     [[ "$count" -gt 0 ]] || { log_warn "菜单无可用选项"; return 1; }
 
     ui_title "$title"
 
-    w=$(term_width)
-    if (( w >= 66 )); then cols=2; else cols=1; fi
-    col_w=$(( (w - 4) / cols ))
-    rows=$(( (count + cols - 1) / cols ))
-
-    for (( r=0; r<rows; r++ )); do
-        printf ' '
-        for (( c=0; c<cols; c++ )); do
-            idx=$(( c * rows + r ))
-            if (( idx < count )); then
-                label="${_items[idx]%%|*}"
-                desc="${_items[idx]#*|}"
-                [[ "$desc" == "${_items[idx]}" ]] && desc=""
-                local cell
-                cell="$(printf '%s%2d)%s %s' "$C_BCYAN" $(( idx + 1 )) "$C_RESET" "$label")"
-                if [[ -n "$desc" ]]; then
-                    cell="$cell ${C_DIM}${desc}${C_RESET}"
-                fi
-                printf '%s' "$(_pad_right "$cell" "$col_w")"
-            else
-                printf '%*s' "$col_w" ''
-            fi
-        done
-        printf '\n'
+    for (( i=0; i<count; i++ )); do
+        label="${_items[i]%%|*}"
+        desc="${_items[i]#*|}"
+        [[ "$desc" == "${_items[i]}" ]] && desc=""
+        cell="$(printf '%s%2d)%s %s' "$C_BCYAN" $(( i + 1 )) "$C_RESET" "$label")"
+        if [[ -n "$desc" ]]; then
+            cell="$cell ${C_DIM}${desc}${C_RESET}"
+        fi
+        printf ' %s\n' "$cell"
     done
 
     printf ' %s%2d)%s %s%s%s\n\n' "$C_DIM" 0 "$C_RESET" "$C_DIM" "$back_label" "$C_RESET"
@@ -727,7 +748,7 @@ _cpu_cores() {
     ' /proc/cpuinfo 2>/dev/null)"
     [[ -z "$physical" || "$physical" == 0 ]] && physical="$logical"
 
-    # 同上，供 read 消费
+    # 输出「物理核 逻辑核」两个字段，供调用方 read 消费
     printf '%s %s\n' "$physical" "$logical"
 }
 
@@ -912,7 +933,7 @@ sys_disk() {
 # 4) 网络接口
 # ============================================================
 sys_network_iface() {
-    local d dev state addrs
+    local d dev addrs
 
     ui_section "网卡"
     if ! have_cmd ip; then
@@ -2278,8 +2299,13 @@ net_dot() {
 
     # ---- 关闭 DoT ----
     if (( choice == ${#DNS_NAMES[@]} )); then
+        local mech
+        mech="$(_dns_mechanism)"
+
         module_begin "关闭 DoT"
         ui_kv "实现方式" "$(_dot_backend_label "$backend")"
+        ui_kv "DNS 管理方式" "$(_dns_mechanism_label "$mech")"
+        ui_kv "关闭后 DNS" "${DNS_IPS[0]}（明文）"
         printf '\n'
         if ! confirm "确认关闭 DoT，恢复明文 DNS?" n; then
             log_info "已取消。"
@@ -2287,21 +2313,49 @@ net_dot() {
             return 0
         fi
 
+        # 恢复明文 DNS 必须走机制分发：resolved 场景下 /etc/resolv.conf 是
+        # 指向它自己生成的 stub 的符号链接，往里写 nameserver 会被立刻重写
+        # 成 127.0.0.53，真正决定上游的是 drop-in。绕开机制直接写文件，
+        # 等于写完就被丢弃，对外却报告「已恢复为明文 DNS」。
+        #
+        # 两套快照都要存：_dot_* 管 drop-in，_dns_* 管 resolv.conf 那条链路，
+        # 它们覆盖的文件不同，缺一个回滚就不完整。
+        _dot_snapshot
+        _dns_snapshot "$mech"
+
+        module_begin "关闭 DoT"
         rm -f "$RESOLVED_DROPIN"
-        if have_cmd systemctl; then
-            systemctl restart systemd-resolved 2>/dev/null || true
+
+        if ! _dns_apply "$mech" "${DNS_IPS[0]}"; then
+            log_err "恢复明文 DNS 失败，正在回滚..."
+            _dot_rollback
+            _dns_rollback "$mech"
+            module_end
+            return 1
         fi
 
-        # 恢复成普通 DNS（取第一个服务商的明文地址）
-        local real="$RESOLV_CONF"
-        [[ -L "$RESOLV_CONF" ]] && real="$(readlink -f "$RESOLV_CONF")"
-        {
-            printf '# 由 Linux 一键配置脚本生成\n'
-            local ip
-            for ip in ${DNS_IPS[0]}; do printf 'nameserver %s\n' "$ip"; done
-        } >"$real"
+        ui_section "验证解析"
+        local ok=0
+        for (( i=0; i<10; i++ )); do
+            _dns_probe_system && { ok=1; break; }
+            sleep 0.5
+        done
 
-        log_ok "DoT 已关闭，DNS 恢复为明文 ${DNS_IPS[0]}"
+        if (( ok )); then
+            log_ok "DoT 已关闭，DNS 恢复为明文 ${DNS_IPS[0]}。"
+        else
+            log_err "关闭后无法解析域名，正在恢复到关闭前的状态..."
+            _dot_rollback
+            _dns_rollback "$mech"
+            if _dns_probe_system; then
+                log_ok "已回到关闭前的配置，DoT 仍然可用。"
+            else
+                log_err "回滚后仍无法解析，请手动检查 $RESOLV_CONF 与 $RESOLVED_DROPIN"
+            fi
+            module_end
+            return 1
+        fi
+
         module_end
         return 0
     fi
@@ -2621,6 +2675,32 @@ _net_rollback() {
     return 0
 }
 
+# ------------------------------------------------------------
+# 中断保护
+#
+# 全新部署的执行窗口是「快照 → 删光 sysctl.d → 写新配置 → 加载 → 验证」。
+# 中途被 Ctrl-C 或 SSH 断线打断时，回滚代码根本轮不到执行：配置已经删了，
+# 快照还躺在没人知道路径的 /tmp 目录里。所以在这个窗口内挂信号处理，
+# 收到信号先还原现场再退出。
+#
+# 快照还没建立时（_net_rollback 会自行判空返回）触发也是安全的。
+# ------------------------------------------------------------
+_net_arm_trap() {
+    trap '_net_on_interrupt' INT TERM HUP
+}
+
+_net_disarm_trap() {
+    trap - INT TERM HUP
+}
+
+_net_on_interrupt() {
+    printf '\n'
+    log_warn "收到中断信号，正在还原网络配置..."
+    _net_rollback
+    log_info "已恢复到变更前的配置。"
+    exit 130
+}
+
 _net_verify() {
     local expect_buf="$1" expect_ipv6="$2"
     local cc qd rm wm v6
@@ -2757,6 +2837,7 @@ net_deploy() {
     # ---- 应用 ----
     module_begin "应用配置"
     _net_snapshot
+    _net_arm_trap      # 从这里开始删改配置，直到验证结束都要防中断
 
     local f n
     for f in "${victims[@]}"; do
@@ -2780,6 +2861,7 @@ net_deploy() {
         log_ok "已写入 $NET_CONF"
     else
         log_err "写入失败，正在回滚..."
+        _net_disarm_trap
         _net_rollback
         module_end
         return 1
@@ -2791,6 +2873,7 @@ net_deploy() {
 
     if _net_verify "$BBR_BUF" "$ipv6"; then
         log_ok "网络优化已生效。"
+        _net_disarm_trap
         rm -rf "${NET_SNAP_DIR:-}"      # 已生效，现场快照不再需要
         NET_SNAP_DIR=''
 
@@ -2805,6 +2888,7 @@ net_deploy() {
         log_info "已建立的连接沿用旧算法，新建连接才走 BBR。"
     else
         log_err "验证未通过，正在回滚..."
+        _net_disarm_trap
         _net_rollback
         log_warn "回滚后请手动检查: sysctl -n net.ipv4.tcp_congestion_control"
         module_end
@@ -3093,7 +3177,18 @@ parse_args() {
             -l|--list)    LIST_ONLY=1 ;;
             -d|--debug)   LOG_LEVEL="debug" ;;
             --no-color)   NO_COLOR_OPT=1; export NO_COLOR=1 ;;
-            --log)        shift; LOG_FILE="${1:-}" ;;
+            --log)
+                # 必须检查缺值：不检查的话下面的 shift 会越界，
+                # 而 LOG_FILE 变成空串等于静默关闭日志（_log_write 对空值直接返回），
+                # 用户以为在记日志，实际什么都没记。
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    printf '选项 --log 需要一个文件路径参数\n\n' >&2
+                    usage
+                    exit 2
+                fi
+                LOG_FILE="$1"
+                ;;
             *)            printf '未知参数: %s\n\n' "$1" >&2; usage; exit 2 ;;
         esac
         shift
@@ -3124,8 +3219,11 @@ load_libs() {
 # 前置检查
 # ------------------------------------------------------------
 preflight() {
-    if (( BASH_VERSINFO[0] < 4 )); then
-        printf '需要 bash 4.0 以上版本，当前为 %s\n' "$BASH_VERSION" >&2
+    # 实际门槛是 4.3：ui_menu / run_submenu 用了 nameref（local -n），
+    # 那是 bash 4.3 才有的特性。写着 4.0 会让 4.0~4.2 的系统通过检查后
+    # 在打开菜单时才报错，不如在这里直接拦下。
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        printf '需要 bash 4.3 以上版本，当前为 %s\n' "$BASH_VERSION" >&2
         exit 1
     fi
     if (( ! SINGLE_FILE )) && [[ ! -d "$MODULES_DIR" ]]; then
@@ -3146,6 +3244,8 @@ preflight() {
 main() {
     parse_args "$@"
     load_libs
+    # 菜单对齐依赖 UTF-8 charmap，越早修正越好（--list 也要用）
+    _ensure_utf8_locale || log_debug "无可用 UTF-8 locale，中文对齐可能不准"
     preflight
 
     detect_system
@@ -3159,7 +3259,10 @@ main() {
         printf '已注册 %d 个模块:\n' "${#MAIN_ITEMS[@]}"
         local i
         for (( i=0; i<${#MAIN_ITEMS[@]}; i++ )); do
-            printf '  %2d) %-16s %s\n' $(( i + 1 )) "${MAIN_ITEMS[i]%%|*}" "${MAIN_ITEMS[i]#*|}"
+            # 用 _pad_right 而不是 printf 的 %-16s：后者按字符数补齐，
+            # 汉字是双宽字符，标题长度一变说明列就错开
+            printf '  %2d) %s %s\n' $(( i + 1 )) \
+                "$(_pad_right "${MAIN_ITEMS[i]%%|*}" 16)" "${MAIN_ITEMS[i]#*|}"
         done
         exit 0
     fi

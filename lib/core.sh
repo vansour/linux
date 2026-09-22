@@ -55,6 +55,36 @@ die()       { log_err "$*"; exit 1; }
 # ------------------------------------------------------------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ------------------------------------------------------------
+# 保证 charmap 是 UTF-8
+#
+# 显示宽度计算依赖 locale：在 C / POSIX locale 下 bash 的 ${#str} 与
+# ${str:i:1} 都按字节走，一个汉字会被算成 3 列而不是 2 列，两列菜单
+# 的补白随之算错、整体错位。LC_ALL=C sudo bash install.sh 就会踩到。
+#
+# 优先只改 LC_CTYPE：不动 LC_MESSAGES，程序输出的语言不受影响。
+# LC_ALL 一旦被设成非 UTF-8 就会盖掉 LC_CTYPE，这时只能连它一起改。
+# C.utf8 是部分发行版的拼法，两个都试一遍。
+# ------------------------------------------------------------
+_ensure_utf8_locale() {
+    have_cmd locale || return 0
+    [[ "$(locale charmap 2>/dev/null)" == "UTF-8" ]] && return 0
+
+    local cand
+    for cand in C.UTF-8 C.utf8; do
+        if [[ -z "${LC_ALL:-}" ]] \
+           && [[ "$(LC_CTYPE="$cand" locale charmap 2>/dev/null)" == "UTF-8" ]]; then
+            export LC_CTYPE="$cand"
+            return 0
+        fi
+        if [[ "$(LC_ALL="$cand" locale charmap 2>/dev/null)" == "UTF-8" ]]; then
+            export LC_ALL="$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
 # is_tty: stdin 是终端才允许交互

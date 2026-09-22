@@ -13,10 +13,12 @@ BOX_H='═'  BOX_V='║'  BOX_ML='╠' BOX_MR='╣'
 BOX_L='─'  BOX_DOT='·'
 
 UI_CHOICE=-1          # ui_menu 的返回值：选项下标(0起)，-1 表示返回/退出
-UI_MENU_WIDTH=${UI_MENU_WIDTH:-0}
 
 # ------------------------------------------------------------
 # 宽度计算：中日韩字符占 2 列，其余占 1 列
+#
+# 依赖 UTF-8 charmap —— C locale 下 ${#str} 和 ${str:i:1} 按字节走，
+# 汉字会计成 3 列。启动时由 core.sh 的 _ensure_utf8_locale 兜住。
 # ------------------------------------------------------------
 _str_width() {
     local str="$1" width=0 i ch code n
@@ -155,42 +157,31 @@ ui_kv() {
 #   ui_menu <标题> <选项数组名> [返回项文案]
 #   选项文案格式支持 "标题|说明"，说明以暗色显示
 #   结果写入全局 UI_CHOICE (0 起下标)，选了返回项则为 -1
+#
+# 一律单列，一项一行。双列要在固定列宽里塞下中英混排的「标题 + 说明」，
+# 说明稍长就会撑破列宽把右边一列顶歪（80 列终端下必然发生），
+# 宽度算错时还会整体错位 —— 单列没有这个约束。
 # ------------------------------------------------------------
 ui_menu() {
     local title="$1" arr_name="$2" back_label="${3:-← 返回}"
     local -n _items="$arr_name"
     local count=${#_items[@]}
-    local i label desc w cols col_w rows r c idx
+    local i label desc cell
 
     UI_CHOICE=-1
     [[ "$count" -gt 0 ]] || { log_warn "菜单无可用选项"; return 1; }
 
     ui_title "$title"
 
-    w=$(term_width)
-    if (( w >= 66 )); then cols=2; else cols=1; fi
-    col_w=$(( (w - 4) / cols ))
-    rows=$(( (count + cols - 1) / cols ))
-
-    for (( r=0; r<rows; r++ )); do
-        printf ' '
-        for (( c=0; c<cols; c++ )); do
-            idx=$(( c * rows + r ))
-            if (( idx < count )); then
-                label="${_items[idx]%%|*}"
-                desc="${_items[idx]#*|}"
-                [[ "$desc" == "${_items[idx]}" ]] && desc=""
-                local cell
-                cell="$(printf '%s%2d)%s %s' "$C_BCYAN" $(( idx + 1 )) "$C_RESET" "$label")"
-                if [[ -n "$desc" ]]; then
-                    cell="$cell ${C_DIM}${desc}${C_RESET}"
-                fi
-                printf '%s' "$(_pad_right "$cell" "$col_w")"
-            else
-                printf '%*s' "$col_w" ''
-            fi
-        done
-        printf '\n'
+    for (( i=0; i<count; i++ )); do
+        label="${_items[i]%%|*}"
+        desc="${_items[i]#*|}"
+        [[ "$desc" == "${_items[i]}" ]] && desc=""
+        cell="$(printf '%s%2d)%s %s' "$C_BCYAN" $(( i + 1 )) "$C_RESET" "$label")"
+        if [[ -n "$desc" ]]; then
+            cell="$cell ${C_DIM}${desc}${C_RESET}"
+        fi
+        printf ' %s\n' "$cell"
     done
 
     printf ' %s%2d)%s %s%s%s\n\n' "$C_DIM" 0 "$C_RESET" "$C_DIM" "$back_label" "$C_RESET"
