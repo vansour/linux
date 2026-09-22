@@ -83,7 +83,7 @@ linux/
 ├── modules/
 │   ├── 01-system.sh     # 系统信息
 │   ├── 02-update.sh     # 系统更新
-│   ├── 03-tools.sh      # 常用工具
+│   ├── 03-tools.sh      # 常用工具（Docker / gh / nginx / 测速）
 │   ├── 04-network.sh    # 网络设置（优化 / DNS / DoT）
 │   ├── 05-user.sh       # 用户管理
 │   └── 06-service.sh    # 服务管理
