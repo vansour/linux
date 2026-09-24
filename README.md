@@ -88,7 +88,7 @@ linux/
 │   ├── 05-user.sh       # 用户管理
 │   ├── 06-service.sh    # 服务管理
 │   ├── 07-swap.sh       # Swap 管理（添加 / 删除 / swappiness）
-│   └── 08-time.sh       # 时间与时区（时区设置 / NTP 自动校时）
+│   └── 08-time.sh       # 时间与时区（时区设置 / NTP 校时 / 服务器）
 └── .shellcheckrc        # shellcheck 配置（多文件 source 架构的误报屏蔽）
 ```
 

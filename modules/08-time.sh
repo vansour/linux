@@ -437,6 +437,527 @@ _time_ntp_wait_sync() {
 }
 
 # ============================================================
+# NTP 服务器配置
+#
+# 三套实现的写法完全不同：
+#   systemd-timesyncd  写 /etc/systemd/timesyncd.conf.d/ 下的 drop-in，
+#                      发行版自带的 timesyncd.conf 一字不动（那个文件自己的
+#                      注释就推荐用 drop-in）
+#   chrony / ntpd      在主配置里维护一个带标记的块
+#
+# 两者都只新增，不改动用户原有的行：chrony 与 ntpd 会在多个源之间自动挑
+# 可达的，所以保留原有的 pool / server 不会冲突，也省得去猜哪一行能动。
+# 撤销就是删掉我们写的那一份（drop-in 文件，或标记块）。
+# ============================================================
+
+TIME_TIMESYNCD_DROPIN="${TIME_TIMESYNCD_DROPIN:-/etc/systemd/timesyncd.conf.d/99-linux-toolkit.conf}"
+TIME_CHRONY_CONF_DEB="${TIME_CHRONY_CONF_DEB:-/etc/chrony/chrony.conf}"
+TIME_CHRONY_CONF_ALT="${TIME_CHRONY_CONF_ALT:-/etc/chrony.conf}"
+TIME_NTPD_CONF="${TIME_NTPD_CONF:-/etc/ntp.conf}"
+
+TIME_BLOCK_BEGIN='# >>> linux-toolkit ntp servers >>>'
+TIME_BLOCK_END='# <<< linux-toolkit ntp servers <<<'
+
+# 备选服务器。国内可达性优先，国际的放后面。
+NTP_SERVER_LIST=(
+    "ntp.aliyun.com"
+    "ntp.tencent.com"
+    "cn.pool.ntp.org"
+    "cn.ntp.org.cn"
+    "ntp.ntsc.ac.cn"
+    "time.cloudflare.com"
+    "pool.ntp.org"
+)
+NTP_SERVER_NOTE=(
+    "阿里云"
+    "腾讯云"
+    "NTP Pool 中国"
+    "国家授时中心"
+    "国家授时中心 NTSC"
+    "Cloudflare"
+    "国际 NTP Pool"
+)
+
+# 当前在用的校时实现。systemd 单元优先，其次按命令找 ——
+# Alpine 这类没有 systemd 单元，只有命令。
+_time_ntp_impl() {
+    local u=''
+    u="$(_time_ntp_unit || true)"
+    [[ -n "$u" ]] && { printf '%s' "$u"; return 0; }
+    if have_cmd chronyd; then printf 'chronyd'; return 0; fi
+    if have_cmd systemd-timesyncd; then printf 'systemd-timesyncd'; return 0; fi
+    if have_cmd ntpd; then printf 'ntpd'; return 0; fi
+    return 1
+}
+
+# 该实现要写的配置文件
+_time_ntp_conf() {
+    case "$1" in
+        systemd-timesyncd) printf '%s' "$TIME_TIMESYNCD_DROPIN" ;;
+        chronyd)
+            if [[ -e "$TIME_CHRONY_CONF_DEB" ]]; then
+                printf '%s' "$TIME_CHRONY_CONF_DEB"
+            else
+                printf '%s' "$TIME_CHRONY_CONF_ALT"
+            fi
+            ;;
+        ntpd) printf '%s' "$TIME_NTPD_CONF" ;;
+        *)    return 1 ;;
+    esac
+}
+
+# 配置里当前的服务器（每行一个）
+_time_ntp_servers_current() {
+    local conf=''
+    case "$1" in
+        systemd-timesyncd)
+            [[ -r "$TIME_TIMESYNCD_DROPIN" ]] || return 0
+            awk -F= '/^NTP=/ { print $2 }' "$TIME_TIMESYNCD_DROPIN"
+            ;;
+        chronyd)
+            conf="$(_time_ntp_conf chronyd)"
+            [[ -r "$conf" ]] || return 0
+            awk '$1 == "server" || $1 == "pool" { print $2 }' "$conf"
+            ;;
+        ntpd)
+            [[ -r "$TIME_NTPD_CONF" ]] || return 0
+            awk '$1 == "server" { print $2 }' "$TIME_NTPD_CONF"
+            ;;
+    esac
+}
+
+# 探测服务器是否真的应答：ok / nodns / noresp / unprobe
+#
+# 只查 DNS 不够 —— 名字能解析不代表 UDP 123 通得过，等配置写完才发现
+# 连不上等于白改。这里真发一个 NTP 客户端请求过去看应答。
+#
+# 关键：48 字节必须一次 write 出去。UDP 面向报文，用
+# `{ printf '\x1b'; head -c 47 /dev/zero; } >&3` 这种写法会分成两次
+# write，变成 1 字节 + 47 字节两个无效包，服务器看都不看，于是所有
+# 服务器都「无应答」—— 这个坑实测踩过。
+_time_probe_ntp() {
+    local host="$1" resp
+
+    have_cmd timeout || { printf 'unprobe'; return 0; }
+
+    if have_cmd getent && ! getent hosts "$host" >/dev/null 2>&1; then
+        printf 'nodns'
+        return 0
+    fi
+
+    exec 3<>"/dev/udp/$host/123" 2>/dev/null || { printf 'nodns'; return 0; }
+    printf '\x1b\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0' >&3 2>/dev/null
+    resp="$(timeout 4 dd bs=48 count=1 <&3 2>/dev/null | od -An -tx1 | head -1)"
+    exec 3<&- 2>/dev/null
+
+    [[ -n "$resp" ]] && printf 'ok' || printf 'noresp'
+}
+
+# 把服务器写进配置。只新增，不动用户原有的行；重复执行不会累积。
+_time_ntp_servers_write() {
+    local impl="$1" servers="$2" conf='' tmp='' mode='' s=''
+
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        mkdir -p "$(dirname "$TIME_TIMESYNCD_DROPIN")" || return 1
+        printf '[Time]\nNTP=%s\n' "$servers" >"$TIME_TIMESYNCD_DROPIN" || return 1
+        return 0
+    fi
+
+    conf="$(_time_ntp_conf "$impl")" || return 1
+    tmp="$(mktemp)" || return 1
+
+    # 先摘掉上次写的块，再追加新的
+    if [[ -r "$conf" ]]; then
+        awk -v b="$TIME_BLOCK_BEGIN" -v e="$TIME_BLOCK_END" '
+            $0 == b { skip = 1; next }
+            $0 == e { skip = 0; next }
+            !skip
+        ' "$conf" >"$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    {
+        printf '%s\n' "$TIME_BLOCK_BEGIN"
+        for s in $servers; do printf 'server %s iburst\n' "$s"; done
+        printf '%s\n' "$TIME_BLOCK_END"
+    } >>"$tmp" || { rm -f "$tmp"; return 1; }
+
+    if [[ -e "$conf" ]]; then
+        mode="$(stat -c %a "$conf" 2>/dev/null || echo 644)"
+        install -m "$mode" "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+    else
+        install -m 0644 "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# 撤掉本工具写的配置，回到发行版默认
+_time_ntp_servers_clear() {
+    local impl="$1" conf='' tmp='' mode=''
+
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        rm -f "$TIME_TIMESYNCD_DROPIN"
+        return 0
+    fi
+
+    conf="$(_time_ntp_conf "$impl")" || return 1
+    [[ -r "$conf" ]] || return 0
+    grep -qF -- "$TIME_BLOCK_BEGIN" "$conf" || return 0   # 没有我们的块，什么都不用做
+
+    tmp="$(mktemp)" || return 1
+    awk -v b="$TIME_BLOCK_BEGIN" -v e="$TIME_BLOCK_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip
+    ' "$conf" >"$tmp" || { rm -f "$tmp"; return 1; }
+
+    mode="$(stat -c %a "$conf" 2>/dev/null || echo 644)"
+    install -m "$mode" "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+
+    # 摘掉我们的块之后一个字都不剩，说明这个文件本来就是为它建的，
+    # 一并删掉，避免留一个空配置文件让人困惑（注释行也算内容，会保留）
+    if ! grep -qvE '^[[:space:]]*$' "$conf" 2>/dev/null; then
+        rm -f "$conf"
+    fi
+    return 0
+}
+
+_time_ntp_conf_snapshot() {
+    local conf
+    TIME_SRV_SNAP_DIR=''
+    TIME_SRV_SNAP_EXISTED=''
+    TIME_SRV_CONF="$(_time_ntp_conf "$1")" || return 1
+    conf="$TIME_SRV_CONF"
+
+    TIME_SRV_SNAP_DIR="$(mktemp -d 2>/dev/null)" || return 1
+    if [[ -e "$conf" ]]; then
+        TIME_SRV_SNAP_EXISTED=1
+        cp -a "$conf" "$TIME_SRV_SNAP_DIR/conf" 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+_time_ntp_conf_snapshot_cleanup() {
+    [[ -n "${TIME_SRV_SNAP_DIR:-}" && -d "${TIME_SRV_SNAP_DIR:-}" ]] && rm -rf "$TIME_SRV_SNAP_DIR"
+    TIME_SRV_SNAP_DIR=''
+    return 0
+}
+
+_time_ntp_conf_rollback() {
+    [[ -n "${TIME_SRV_SNAP_DIR:-}" && -d "${TIME_SRV_SNAP_DIR:-}" ]] || return 0
+    if [[ -n "${TIME_SRV_SNAP_EXISTED:-}" ]]; then
+        cp -a "$TIME_SRV_SNAP_DIR/conf" "$TIME_SRV_CONF" 2>/dev/null || true
+    else
+        rm -f "$TIME_SRV_CONF"      # 原本没有就得删掉，不能留个我们建的文件
+    fi
+    _time_ntp_conf_snapshot_cleanup
+    return 0
+}
+
+# 写完后确认服务器真的进了生效配置。
+# timesyncd 用 systemd-analyze cat-config 看合并后的结果 —— 这能证明
+# drop-in 的路径与写法都被认了，而不只是「文件写出去了」。
+_time_ntp_servers_verify() {
+    local impl="$1" servers="$2" conf='' eff='' s=''
+
+    if [[ "$impl" == "systemd-timesyncd" ]] && have_cmd systemd-analyze; then
+        if eff="$(systemd-analyze cat-config systemd/timesyncd.conf 2>/dev/null)" && [[ -n "$eff" ]]; then
+            for s in $servers; do
+                [[ "$eff" == *"$s"* ]] || { printf '生效配置里没有 %s' "$s"; return 1; }
+            done
+            return 0
+        fi
+    fi
+
+    conf="$(_time_ntp_conf "$impl")"
+    [[ -r "$conf" ]] || { printf '%s 读不到' "$conf"; return 1; }
+    for s in $servers; do
+        grep -qF -- "$s" "$conf" || { printf '配置里没有 %s' "$s"; return 1; }
+    done
+    return 0
+}
+
+# 让新配置生效：重启校时服务，并等它真的连上其中一个服务器
+_time_ntp_reload() {
+    local impl="$1" servers="$2" srv='' i s=''
+
+    case "$impl" in
+        systemd-timesyncd)
+            _time_have_systemd || return 0
+            [[ "$(_time_td_get NTP)" == "yes" ]] || {
+                log_info "NTP 自动校时当前是关闭的，配置已写入，等开启后生效。"
+                return 0
+            }
+            systemctl restart systemd-timesyncd >/dev/null 2>&1 || {
+                log_warn "重启 systemd-timesyncd 失败，配置已写入但可能未生效。"
+                return 0
+            }
+            # 没指定服务器（恢复默认的场景）就只确认服务起来了 ——
+            # 不去等它连上谁，否则会白白等满超时再报一句吓人的假警报
+            if [[ -z "${servers// /}" ]]; then
+                log_ok "服务已重启，已回到发行版默认服务器。"
+                return 0
+            fi
+            for (( i=0; i<10; i++ )); do
+                srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+                for s in $servers; do
+                    [[ "$srv" == *"$s"* ]] && { log_ok "已连上 $srv"; return 0; }
+                done
+                sleep 1
+            done
+            log_warn "服务已重启，但 10 秒内没看到它连上指定的服务器。"
+            log_info "可能是出站 UDP 123 不通，稍后可用「状态查看」再看。"
+            ;;
+        *)
+            # chrony / ntpd 走各自的 init
+            if have_cmd systemctl && _time_have_systemd; then
+                systemctl restart "$impl" >/dev/null 2>&1 && log_ok "已重启 $impl"
+            elif have_cmd rc-service; then
+                rc-service "$impl" restart >/dev/null 2>&1 && log_ok "已重启 $impl"
+            elif have_cmd service; then
+                service "$impl" restart >/dev/null 2>&1 && log_ok "已重启 $impl"
+            else
+                log_info "没找到可用的服务管理命令，请手动重启 $impl 让配置生效。"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 恢复发行版默认
+_time_ntp_server_restore() {
+    local impl="$1" conf=''
+
+    conf="$(_time_ntp_conf "$impl")"
+
+    module_begin "恢复默认校时服务器"
+    ui_section "将删除"
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        if [[ -e "$TIME_TIMESYNCD_DROPIN" ]]; then
+            printf '  %s-%s %s\n' "$C_RED" "$C_RESET" "$TIME_TIMESYNCD_DROPIN"
+        else
+            printf '  %s本工具没有写过配置，无需删除%s\n' "$C_DIM" "$C_RESET"
+            module_end
+            return 0
+        fi
+    else
+        if [[ -r "$conf" ]] && grep -qF -- "$TIME_BLOCK_BEGIN" "$conf"; then
+            printf '  %s-%s %s 中本工具写的那一段（标记之间）\n' "$C_RED" "$C_RESET" "$conf"
+            printf '  %s  用户原有的 pool / server 行一律保留%s\n' "$C_DIM" "$C_RESET"
+        else
+            printf '  %s本工具没有写过配置，无需删除%s\n' "$C_DIM" "$C_RESET"
+            module_end
+            return 0
+        fi
+    fi
+
+    ui_section "不受影响"
+    printf '  %s发行版自带的配置文件、其它服务器配置一律不动%s\n' "$C_DIM" "$C_RESET"
+    printf '  %s校时服务本身不卸载、不停止%s\n' "$C_DIM" "$C_RESET"
+
+    printf '\n'
+    if ! confirm "确认恢复默认?" n; then
+        log_info "已取消，未做任何修改。"
+        module_end
+        return 0
+    fi
+
+    module_begin "执行"
+    if ! _time_ntp_conf_snapshot "$impl"; then
+        log_err "无法备份现有配置，为安全起见不做修改。"
+        module_end
+        return 1
+    fi
+    if ! _time_ntp_servers_clear "$impl"; then
+        log_err "删除失败，正在回滚..."
+        _time_ntp_conf_rollback
+        module_end
+        return 1
+    fi
+    _time_ntp_conf_snapshot_cleanup
+    log_ok "已恢复发行版默认。"
+    _time_ntp_reload "$impl" ""
+    module_end
+}
+
+# ============================================================
+# 设置 NTP 服务器
+# ============================================================
+time_ntp_server() {
+    require_root
+
+    local impl='' conf='' cur='' i s='' servers='' custom_idx=0
+    local items=() srv='' mode=''
+    local ok_n=0 bad_n=0 unres_n=0 bad_list='' unres_list=''
+
+    module_begin "设置 NTP 服务器"
+
+    if ! impl="$(_time_ntp_impl)"; then
+        log_warn "系统里没有安装任何校时服务，暂时无处可写。"
+        log_info "请先执行「开启自动校时」装一个（那里会说明装的是哪个），再回来设置服务器。"
+        module_end
+        return 0
+    fi
+
+    conf="$(_time_ntp_conf "$impl")"
+    cur="$(_time_ntp_servers_current "$impl" | tr '\n' ' ')"
+    cur="${cur% }"
+
+    ui_section "当前状态"
+    ui_kv "校时实现" "$impl"
+    ui_kv "配置文件" "$conf"
+    if [[ -n "$cur" ]]; then
+        ui_kv "当前服务器" "$cur"
+    else
+        ui_kv "当前服务器" "本工具未配置过"
+    fi
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+        [[ -n "$srv" ]] && ui_kv "正在使用" "$srv"
+    fi
+
+    for (( i=0; i<${#NTP_SERVER_LIST[@]}; i++ )); do
+        items+=("${NTP_SERVER_LIST[i]}|${NTP_SERVER_NOTE[i]}")
+    done
+    custom_idx=${#items[@]}
+    items+=("手动输入地址|可填多个，空格分隔")
+    items+=("恢复默认|删掉本工具写的配置")
+
+    ui_menu "选择 NTP 服务器" items "← 放弃修改"
+    (( UI_CHOICE < 0 )) && return 0
+
+    if (( UI_CHOICE == custom_idx + 1 )); then
+        _time_ntp_server_restore "$impl"
+        return $?
+    fi
+
+    if (( UI_CHOICE == custom_idx )); then
+        module_begin "手动输入 NTP 服务器"
+        printf '  %s可填多个，用空格分隔。例: ntp.aliyun.com ntp.tencent.com%s\n\n' "$C_DIM" "$C_RESET"
+        while true; do
+            if ! ask "服务器地址（直接回车放弃）" ""; then
+                log_info "输入中断，已取消。"
+                return 0
+            fi
+            servers="${REPLY//,/ }"
+            [[ -n "${servers// /}" ]] || { log_info "未输入，已取消。"; return 0; }
+
+            # 逐个体检。只允许主机名 / IPv4 的字符集 —— 地址要拼进配置文件，
+            # 放行任意字符等于让用户能往配置里注任意内容
+            local bad=''
+            for s in $servers; do
+                [[ "$s" =~ ^[A-Za-z0-9._-]+$ ]] || { bad="$s"; break; }
+            done
+            if [[ -n "$bad" ]]; then
+                log_warn "「$bad」不是合法的服务器地址（只允许字母、数字与 . _ -）"
+                continue
+            fi
+            break
+        done
+    else
+        servers="${NTP_SERVER_LIST[UI_CHOICE]}"
+    fi
+
+    # ---- 探测：真发 NTP 请求，不只看 DNS ----
+    module_begin "探测服务器"
+    for s in $servers; do
+        case "$(_time_probe_ntp "$s")" in
+            ok)      log_ok "$s 应答正常"; ok_n=$(( ok_n + 1 )) ;;
+            nodns)   log_err "$s 解析不了（域名可能写错）"; bad_n=$(( bad_n + 1 )); bad_list+="$s " ;;
+            noresp)  log_warn "$s 无应答（UDP 123 可能不通）"; unres_n=$(( unres_n + 1 )); unres_list+="$s " ;;
+            *)       log_info "本机无法探测，跳过"; unres_n=$(( unres_n + 1 )); unres_list+="$s " ;;
+        esac
+    done
+
+    if (( bad_n > 0 )); then
+        log_err "有地址解析不了，未做任何修改。"
+        module_end
+        return 0
+    fi
+
+    # ---- 预览 ----
+    module_begin "确认变更"
+    ui_section "将写入"
+    ui_kv "配置文件" "$conf"
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        ui_kv "形式" "drop-in 文件（发行版自带的 timesyncd.conf 不动）"
+        printf '  %s[Time]%s\n' "$C_DIM" "$C_RESET"
+        printf '  %sNTP=%s%s\n' "$C_BCYAN" "$servers" "$C_RESET"
+    else
+        ui_kv "形式" "在配置文件末尾追加一个带标记的块"
+        for s in $servers; do
+            printf '  %s+%s server %s iburst\n' "$C_GREEN" "$C_RESET" "$s"
+        done
+    fi
+
+    ui_section "不会改动"
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        printf '  %s发行版自带的 /etc/systemd/timesyncd.conf 一字不动%s\n' "$C_DIM" "$C_RESET"
+    else
+        printf '  %s已有的 pool / server 行一律保留 —— %s 会在多个源之间自动挑可达的%s\n' \
+            "$C_DIM" "$impl" "$C_RESET"
+        printf '  %s只动标记块之内的内容%s\n' "$C_DIM" "$C_RESET"
+    fi
+    printf '  %s时区、NTP 开关状态、软件包一律不动%s\n' "$C_DIM" "$C_RESET"
+
+    ui_section "将备份（仅失败回滚用，成功后删除）"
+    if [[ -e "$conf" ]]; then
+        ui_kv "$conf" "整份复制到临时目录"
+    else
+        printf '  %s%s 不存在，将新建（回滚时会删掉它）%s\n' "$C_DIM" "$conf" "$C_RESET"
+    fi
+
+    if (( unres_n > 0 )); then
+        printf '\n'
+        log_warn "以下服务器没有应答: ${unres_list% }"
+        log_info "可能只是 UDP 123 出站被挡。仍可写入，但同步未必能成。"
+    fi
+
+    printf '\n'
+    if ! confirm "确认写入?" n; then
+        log_info "已取消，未做任何修改。"
+        module_end
+        return 0
+    fi
+
+    # ---- 执行 ----
+    module_begin "执行"
+    if ! _time_ntp_conf_snapshot "$impl"; then
+        log_err "无法备份现有配置，为安全起见不做任何修改。"
+        _time_ntp_conf_snapshot_cleanup
+        module_end
+        return 1
+    fi
+
+    if ! _time_ntp_servers_write "$impl" "$servers"; then
+        log_err "写入失败，正在回滚..."
+        _time_ntp_conf_rollback
+        log_info "已恢复到变更前的状态。"
+        module_end
+        return 1
+    fi
+    log_ok "已写入 $conf"
+
+    # ---- 验证 ----
+    if ! mode="$(_time_ntp_servers_verify "$impl" "$servers")"; then
+        log_err "验证未通过（$mode），正在回滚..."
+        _time_ntp_conf_rollback
+        log_info "已恢复到变更前的状态。"
+        module_end
+        return 1
+    fi
+    log_ok "生效配置中已包含所选服务器"
+
+    _time_ntp_conf_snapshot_cleanup
+    _time_ntp_reload "$impl" "$servers"
+
+    ui_section "设置后"
+    ui_kv "配置文件" "$conf"
+    ui_kv "服务器" "$servers"
+    module_end
+}
+
+# ============================================================
 # 1) 状态查看（只读）
 # ============================================================
 time_status() {
@@ -488,14 +1009,15 @@ time_status() {
     fi
 
     ui_section "自动校时"
+    local impl='' srv='' srvlist=''
+    impl="$(_time_ntp_impl || true)"
+
     if _time_have_systemd; then
-        local unit=''
-        unit="$(_time_ntp_unit || true)"
-        if [[ -n "$unit" ]]; then
-            if _time_ntp_active "$unit"; then
-                ui_kv "校时服务" "$unit（运行中）"
+        if [[ -n "$impl" ]]; then
+            if _time_ntp_active "$impl"; then
+                ui_kv "校时服务" "$impl（运行中）"
             else
-                ui_kv "校时服务" "$unit（未运行）"
+                ui_kv "校时服务" "$impl（未运行）"
             fi
         else
             ui_kv "校时服务" "未安装"
@@ -506,9 +1028,21 @@ time_status() {
         ui_kv "RTC 走本地时间" "$(_time_td_get LocalRTC)"
     else
         ui_kv "systemd" "未运行（timedatectl 不可用）"
-        local u=''
-        u="$(_time_ntp_unit || true)"
-        ui_kv "校时服务" "${u:-未安装}"
+        ui_kv "校时服务" "${impl:-未安装}"
+    fi
+
+    if [[ -n "$impl" ]]; then
+        srvlist="$(_time_ntp_servers_current "$impl" | tr '\n' ' ')"
+        srvlist="${srvlist% }"
+        if [[ -n "$srvlist" ]]; then
+            ui_kv "已配服务器" "$srvlist"
+        else
+            ui_kv "已配服务器" "本工具未配置过（用发行版默认）"
+        fi
+        if _time_have_systemd; then
+            srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+            [[ -n "$srv" ]] && ui_kv "正在使用" "$srv"
+        fi
     fi
 
     ui_section "时区数据库"
@@ -1174,9 +1708,10 @@ menu_time() {
         "设置时区|常用列表或手动输入，改前预览确认"
         "开启自动校时|启用 NTP，缺少客户端时提示并安装"
         "关闭自动校时|停用 NTP 校时，不卸载软件包"
+        "设置 NTP 服务器|自定义校时服务器，写前先探测可达性"
         "立即校时|用已配置的客户端强制同步一次"
     )
-    local fns=(time_status time_set_tz time_ntp_on time_ntp_off time_ntp_sync)
+    local fns=(time_status time_set_tz time_ntp_on time_ntp_off time_ntp_server time_ntp_sync)
     run_submenu "时间与时区" items fns
 }
 
