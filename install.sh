@@ -4082,8 +4082,14 @@ _time_tz_source_label() {
 
 # 头四字节是不是 TZif（tzfile 的魔数）。
 # zoneinfo 顶层躺着 leapseconds 这类纯文本文件，光看存在性会放它过去。
+#
+# 用 read -n 4 而不是 head -c 4：后者每个文件 fork 一次，浏览全部时区时
+# 要校验四百多个文件，实测 1.3 秒，进菜单前会明显卡一下；read 是内建，
+# 同样这批文件 0.016 秒。两者对真实/伪造 tzfile 的判定完全一致。
 _time_tz_is_tzfile() {
-    [[ "$(head -c 4 "$1" 2>/dev/null)" == "TZif" ]]
+    local magic=''
+    IFS= read -r -n 4 magic <"$1" 2>/dev/null
+    [[ "$magic" == "TZif" ]]
 }
 
 _time_tz_valid() {
@@ -5159,10 +5165,177 @@ _time_tz_change() {
     module_end
 }
 
+# ------------------------------------------------------------
+# 浏览全部时区
+#
+# zoneinfo 下光文件名就有四百多个（America 一个地区 157 个），
+# 平铺成一个菜单既列不下也没法看，所以按地区分组 + 分页。
+# ------------------------------------------------------------
+
+# 终端行数，用来定分页大小。取不到就按 24 行算。
+_time_term_rows() {
+    local r="${LINES:-0}"
+    (( r > 0 )) || r="$(tput lines 2>/dev/null || echo 24)"
+    [[ "$r" =~ ^[0-9]+$ ]] || r=24
+    (( r >= 12 )) || r=12
+    printf '%s' "$r"
+}
+
+# 地区名 → 中文标签。空串代表顶层那些不属于任何地区的时区。
+_time_zone_region_label() {
+    case "$1" in
+        "")         printf '其它' ;;
+        Africa)     printf '非洲' ;;
+        America)    printf '美洲' ;;
+        Antarctica) printf '南极洲' ;;
+        Arctic)     printf '北极' ;;
+        Asia)       printf '亚洲' ;;
+        Atlantic)   printf '大西洋' ;;
+        Australia)  printf '澳大利亚' ;;
+        Etc)        printf 'Etc（固定偏移）' ;;
+        Europe)     printf '欧洲' ;;
+        Indian)     printf '印度洋' ;;
+        Pacific)    printf '太平洋' ;;
+        US|Canada|Brazil|Chile|Mexico)
+                    printf '%s（旧式别名）' "$1" ;;
+        *)          printf '%s' "$1" ;;
+    esac
+}
+
+# 某地区下真正可用的时区，每行一个（已按名字排序）。
+# 地区名为空 = 顶层散装时区（UTC / GMT 这些）。
+_time_zone_list_region() {
+    local base f
+    if [[ -z "$1" ]]; then
+        base="$TIME_ZONEINFO"
+        find -L "$base" -maxdepth 1 -type f 2>/dev/null | sort | while IFS= read -r f; do
+            f="${f#"$TIME_ZONEINFO"/}"
+            _time_tz_valid "$f" && printf '%s\n' "$f"
+        done
+        return 0
+    fi
+
+    base="$TIME_ZONEINFO/$1"
+    [[ -d "$base" ]] || return 0
+    # 递归：America 底下还有 Argentina / Indiana / Kentucky / North_Dakota 一层
+    find -L "$base" -type f 2>/dev/null | sort | while IFS= read -r f; do
+        f="${f#"$TIME_ZONEINFO"/}"
+        _time_tz_valid "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+_time_zone_count_region() {
+    _time_zone_list_region "$1" | wc -l | tr -d ' '
+}
+
+# 全部地区（含用空串表示的顶层）。空的地区由调用方按数量过滤掉。
+_time_zone_regions() {
+    local d
+    for d in "$TIME_ZONEINFO"/*/; do
+        [[ -d "$d" ]] || continue
+        printf '%s\n' "$(basename "$d")"
+    done
+    printf '\n'      # 顶层散装
+    return 0
+}
+
+# 分页菜单。选中把下标写进 UI_CHOICE，放弃写 -1。
+#
+# 不用 ui_menu：它一次把所有选项铺完，一百多项会直接冲掉整个回滚缓冲，
+# 用户得拿终端回滚当翻页用。这里按终端高度算每页条数，n/p 翻页、q 放弃。
+_time_menu_paged() {
+    local title="$1" arr_ref="$2"
+    local -n _pg="$arr_ref"
+    local total=${#_pg[@]}
+    local per rows pages page=0 i start end choice err=''
+
+    rows="$(_time_term_rows)"
+    per=$(( rows - 16 ))          # 减掉横幅、标题、翻页提示与输入提示占的行
+    (( per >= 8 ))  || per=8
+    (( per <= 40 )) || per=40
+
+    pages=$(( (total + per - 1) / per ))
+    (( pages >= 1 )) || pages=1
+
+    UI_CHOICE=-1
+    while true; do
+        ui_screen
+        ui_title "$title（第 $(( page + 1 ))/$pages 页 · 共 $total 项）"
+        # 每次都重画屏幕，报错得画在重画之后，否则会被清掉看不见
+        [[ -n "$err" ]] && { printf ' %s%s%s\n\n' "$C_RED" "$err" "$C_RESET"; err=''; }
+
+        start=$(( page * per ))
+        end=$(( start + per ))
+        (( end <= total )) || end=$total
+        for (( i=start; i<end; i++ )); do
+            printf ' %s%3d)%s %s\n' "$C_BCYAN" $(( i + 1 )) "$C_RESET" "${_pg[i]}"
+        done
+
+        printf '\n '
+        (( page > 0 ))        && printf '%sn)%s 上一页  ' "$C_DIM" "$C_RESET"
+        (( page < pages - 1 )) && printf '%sp)%s 下一页  ' "$C_DIM" "$C_RESET"
+        printf '%sq)%s 放弃\n\n' "$C_DIM" "$C_RESET"
+
+        printf '%s请输入序号%s %s[1-%d]%s: ' "$C_BYELLOW" "$C_RESET" "$C_DIM" "$total" "$C_RESET"
+        ui_read choice || { printf '\n'; UI_CHOICE=-1; return 0; }
+
+        case "$choice" in
+            q|Q) UI_CHOICE=-1; return 0 ;;
+            n|N) (( page < pages - 1 )) && page=$(( page + 1 )); continue ;;
+            p|P) (( page > 0 )) && page=$(( page - 1 )); continue ;;
+        esac
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )); then
+            UI_CHOICE=$(( choice - 1 ))
+            return 0
+        fi
+        err="无效输入，请输入序号或用 n / p / q"
+    done
+}
+
+# 按地区浏览全部时区。选中的时区名写进 TIME_PICKED_TZ，空串表示放弃。
+#
+# 结果走全局变量而不是 stdout：这个函数要画好几屏界面，那些输出也在
+# stdout 上，用 tz="$(_time_zone_browse)" 接结果会把界面文字一起接走，
+# 于是「时区名」变成一整屏菜单，验证必然不过。
+_time_zone_browse() {
+    local regions=() items=() zones=() r n='' tz=''
+
+    TIME_PICKED_TZ=''
+
+    while IFS= read -r r; do
+        n="$(_time_zone_count_region "$r")"
+        (( n > 0 )) || continue
+        regions+=("$r")
+        items+=("$(_time_zone_region_label "$r")|$n 个")
+    done < <(_time_zone_regions)
+
+    module_begin "全部时区"
+    if (( ${#regions[@]} == 0 )); then
+        log_warn "$TIME_ZONEINFO 下没有找到可用的时区，可能需要安装 tzdata。"
+        module_end
+        return 0
+    fi
+
+    ui_menu "选择地区" items "← 返回"
+    (( UI_CHOICE < 0 )) && return 0
+    r="${regions[UI_CHOICE]}"
+
+    while IFS= read -r tz; do
+        [[ -n "$tz" ]] && zones+=("$tz")
+    done < <(_time_zone_list_region "$r")
+    (( ${#zones[@]} > 0 )) || return 0
+
+    _time_menu_paged "时区 · $(_time_zone_region_label "$r")" zones || return 0
+    (( UI_CHOICE >= 0 )) || return 0
+    TIME_PICKED_TZ="${zones[UI_CHOICE]}"
+    return 0
+}
+
 time_set_tz() {
     require_root
 
-    local i tz='' items=() zones=() custom_idx=0 cur=''
+    local i tz='' items=() zones=() custom_idx=0 browse_idx=0 cur=''
 
     cur="$(_time_tz_current || true)"
 
@@ -5174,7 +5347,9 @@ time_set_tz() {
         zones+=("$tz")
         items+=("$tz|${TIME_ZONE_NOTE[i]}  UTC$(_time_tz_offset "$tz")")
     done
-    custom_idx=${#zones[@]}
+    browse_idx=${#zones[@]}
+    items+=("按地区浏览全部时区|按地区分组，分页显示")
+    custom_idx=$(( browse_idx + 1 ))
     items+=("手动输入时区名|如 America/New_York、Europe/Berlin")
 
     module_begin "设置时区"
@@ -5192,7 +5367,11 @@ time_set_tz() {
     ui_menu "选择时区" items "← 放弃修改"
     (( UI_CHOICE < 0 )) && return 0
 
-    if (( UI_CHOICE == custom_idx )); then
+    if (( UI_CHOICE == browse_idx )); then
+        _time_zone_browse
+        tz="$TIME_PICKED_TZ"
+        [[ -n "$tz" ]] || return 0
+    elif (( UI_CHOICE == custom_idx )); then
         module_begin "手动输入时区名"
         printf '  %s时区名形如 地区/城市，可用 ls %s/地区 查看%s\n\n' \
             "$C_DIM" "$TIME_ZONEINFO" "$C_RESET"
