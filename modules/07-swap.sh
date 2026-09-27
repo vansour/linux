@@ -174,7 +174,7 @@ _swap_fstab_clean() {
     [[ -n "$(_swap_fstab_lines "$path")" ]] || return 0
     tmp="$(mktemp)" || return 1
     if awk -v p="$path" '!($1 == p && $3 == "swap")' "$SWAP_FSTAB" >"$tmp"; then
-        if install -m 0644 "$tmp" "$SWAP_FSTAB"; then
+        if install_keep_mode "$tmp" "$SWAP_FSTAB"; then
             rm -f "$tmp"
             return 0
         fi

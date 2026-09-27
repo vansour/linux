@@ -1077,13 +1077,16 @@ net_deploy() {
     if (( ${#conf_lines[@]} > 0 )); then
         local tmp
         tmp="$(mktemp)"
-        awk -v lines="${conf_lines[*]}" '
+        if awk -v lines="${conf_lines[*]}" '
             BEGIN { n = split(lines, a, " "); for (i=1;i<=n;i++) skip[a[i]] = 1 }
             skip[NR] { printf "# [linux-toolkit] 被网络配置覆盖: %s\n", $0; next }
             { print }
-        ' "$SYSCTL_CONF" >"$tmp" && install -m 0644 "$tmp" "$SYSCTL_CONF"
+        ' "$SYSCTL_CONF" >"$tmp" && install_keep_mode "$tmp" "$SYSCTL_CONF"; then
+            log_ok "已注释 $SYSCTL_CONF 中 ${#conf_lines[@]} 行冲突设置"
+        else
+            log_warn "注释 $SYSCTL_CONF 失败，其中的冲突设置可能盖住新配置。"
+        fi
         rm -f "$tmp"
-        log_ok "已注释 $SYSCTL_CONF 中 ${#conf_lines[@]} 行冲突设置"
     fi
 
     mkdir -p "$(dirname "$NET_CONF")"
@@ -1202,6 +1205,13 @@ net_ipv6_toggle() {
     if [[ "$now" == "$target" ]]; then
         log_ok "IPv6 已${label}。"
         log_info "仅对新连接与新接口生效；已有 IPv6 地址不会立刻消失。"
+    elif [[ -z "$now" ]]; then
+        # 内核未编译 IPv6 时 /proc/sys/net/ipv6 整个不存在，sysctl 读出来是空的、
+        # 写进去静默无效。这不是「配置被覆盖」，报成未生效只会误导排查方向。
+        log_warn "读不到 net.ipv6.conf.all.disable_ipv6。"
+        log_info "当前内核可能未编译 IPv6 支持（无 /proc/sys/net/ipv6），此项无从设置。"
+        module_end
+        return 1
     else
         log_err "设置未生效（当前值 $now），可能有更高优先级的配置覆盖了它。"
         log_info "检查: sysctl -n net.ipv6.conf.all.disable_ipv6"
