@@ -5,12 +5,11 @@
 # ============================================================
 
 APP_NAME="${APP_NAME:-Linux 一键配置脚本}"
-APP_VERSION="${APP_VERSION:-0.0.1}"
 
 # 边框字符
 BOX_TL='╔' BOX_TR='╗' BOX_BL='╚' BOX_BR='╝'
 BOX_H='═'  BOX_V='║'  BOX_ML='╠' BOX_MR='╣'
-BOX_L='─'  BOX_DOT='·'
+BOX_L='─'
 
 UI_CHOICE=-1          # ui_menu 的返回值：选项下标(0起)，-1 表示返回/退出
 
@@ -100,7 +99,7 @@ ui_banner() {
     w=$(term_width)
     inner=$(( w - 2 ))                      # 两个 ║ 各占 1 列，其余为内容宽度
 
-    title="$APP_NAME  v$APP_VERSION"
+    title="$APP_NAME"
     line1="${DISTRO_NAME}${DISTRO_VERSION:+ $DISTRO_VERSION}  |  $ARCH  |  ${DISTRO_FAMILY}"
     if is_root; then
         line2="权限: root ✓"

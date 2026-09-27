@@ -42,26 +42,6 @@ _src_files+=("${_module_files[@]}")
 _src_files+=("$ROOT/main.sh")
 
 # ------------------------------------------------------------
-# 打包前校验：版本号在 main.sh / lib/ui.sh 两处都出现过，防止改一处漏一处
-# ------------------------------------------------------------
-# main.sh 是版本号唯一真源；lib/ui.sh 里的是给「单独 source 调试」用的兜底默认值。
-# 两处都提取形如 x.y.z 的版本号做比对。
-_extract_version() {
-    grep -m1 '^APP_VERSION=' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
-}
-_ver_main="$(_extract_version "$ROOT/main.sh")"
-_ver_ui="$(_extract_version "$ROOT/lib/ui.sh")"
-
-if [[ -z "$_ver_main" ]]; then
-    printf '无法从 main.sh 解析出 APP_VERSION\n' >&2
-    exit 1
-fi
-if [[ "$_ver_main" != "$_ver_ui" ]]; then
-    printf '版本号不一致: main.sh=%s  lib/ui.sh=%s\n' "$_ver_main" "$_ver_ui" >&2
-    exit 1
-fi
-
-# ------------------------------------------------------------
 # 生成
 #
 # 先写到临时文件，全部自检通过后才落到 $OUT。直接写 $OUT 的话，
@@ -74,7 +54,7 @@ trap 'rm -f "$_TMP_OUT"; rm -rf "${_isolated:-}"' EXIT
 {
     printf '#!/usr/bin/env bash\n'
     printf '# ============================================================\n'
-    printf '#  %s  v%s  —— 单文件版（自动生成，请勿直接编辑）\n' "Linux 一键配置脚本" "$_ver_main"
+    printf '#  Linux 一键配置脚本 —— 单文件版（自动生成，请勿直接编辑）\n'
     printf '#\n'
     printf '#  不写入生成时间：产物需完全可复现，否则 pre-commit 钩子\n'
     printf '#  每次重建都会产生无意义的 diff。构建时间看 git log。\n'
@@ -99,12 +79,6 @@ chmod +x "$_TMP_OUT"
 # ------------------------------------------------------------
 if ! bash -n "$_TMP_OUT"; then
     printf '打包结果语法错误，已保留原 %s 不变\n' "$(basename "$OUT")" >&2
-    exit 1
-fi
-
-_ver_out="$(bash "$_TMP_OUT" --version 2>/dev/null || true)"
-if [[ "$_ver_out" != "$_ver_main" ]]; then
-    printf '打包结果 --version 输出异常: 期望 %s，实际 %s\n' "$_ver_main" "${_ver_out:-空}" >&2
     exit 1
 fi
 
@@ -135,6 +109,5 @@ chmod +x "$OUT"
 _lines="$(wc -l <"$OUT")"
 _size="$(du -h "$OUT" | cut -f1)"
 printf '✓ 打包完成: %s\n' "$OUT"
-printf '  %s 行, %s, 版本 v%s, 内联 %d 个文件\n' \
-    "$_lines" "$_size" "$_ver_main" "${#_src_files[@]}"
+printf '  %s 行, %s, 内联 %d 个文件\n' "$_lines" "$_size" "${#_src_files[@]}"
 printf '  运行: sudo bash %s\n' "$(basename "$OUT")"

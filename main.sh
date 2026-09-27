@@ -11,7 +11,6 @@ set -uo pipefail
 SINGLE_FILE="${SINGLE_FILE:-0}"
 
 APP_NAME="Linux 一键配置脚本"
-APP_VERSION="0.0.1"
 SELF_NAME="${SELF_NAME:-$(basename "${BASH_SOURCE[0]}")}"
 
 # ------------------------------------------------------------
@@ -43,7 +42,7 @@ LOG_LEVEL="info"
 
 usage() {
     cat <<EOF
-$APP_NAME  v$APP_VERSION
+$APP_NAME
 
 用法:
   sudo bash $SELF_NAME [选项]
@@ -54,7 +53,6 @@ $APP_NAME  v$APP_VERSION
 
 选项:
   -h, --help        显示本帮助
-  -V, --version     显示版本号
   -l, --list        列出所有已注册的功能模块后退出
   -d, --debug       输出调试日志
       --no-color    禁用彩色输出
@@ -70,7 +68,6 @@ parse_args() {
     while (($#)); do
         case "$1" in
             -h|--help)    usage; exit 0 ;;
-            -V|--version) printf '%s\n' "$APP_VERSION"; exit 0 ;;
             -l|--list)    LIST_ONLY=1 ;;
             -d|--debug)   LOG_LEVEL="debug" ;;
             --no-color)   NO_COLOR_OPT=1; export NO_COLOR=1 ;;
@@ -151,7 +148,7 @@ main() {
     build_main_menu
 
     if (( LIST_ONLY )); then
-        printf '%s v%s\n' "$APP_NAME" "$APP_VERSION"
+        printf '%s\n' "$APP_NAME"
         printf '系统: %s %s (%s / %s)\n' "$DISTRO_NAME" "$DISTRO_VERSION" "$DISTRO_FAMILY" "$ARCH"
         printf '已注册 %d 个模块:\n' "${#MAIN_ITEMS[@]}"
         local i
