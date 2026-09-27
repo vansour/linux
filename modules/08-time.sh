@@ -445,18 +445,30 @@ _time_ntp_wait_sync() {
 # ============================================================
 # NTP 服务器配置
 #
-# 三套实现的写法完全不同：
-#   systemd-timesyncd  写 /etc/systemd/timesyncd.conf.d/ 下的 drop-in，
-#                      发行版自带的 timesyncd.conf 一字不动（那个文件自己的
-#                      注释就推荐用 drop-in）
-#   chrony / ntpd      在主配置里维护一个带标记的块
+# 两套写法，各自贴合对应守护进程的惯例：
+#   systemd-timesyncd  /etc/systemd/timesyncd.conf.d/ 下放一个 drop-in
+#   chrony / ntpd      在主配置里追加一个带标记的块
 #
-# 两者都只新增，不改动用户原有的行：chrony 与 ntpd 会在多个源之间自动挑
-# 可达的，所以保留原有的 pool / server 不会冲突，也省得去猜哪一行能动。
-# 撤销就是删掉我们写的那一份（drop-in 文件，或标记块）。
+# timesyncd 用 drop-in 而不是改主配置：那个文件自己的注释就推荐这么做，
+# 而且它属于 systemd 包的 conffile —— 改它 apt 升级时 dpkg 会弹提示
+# （保留本地版还是换成发行版版），选错就把设好的服务器丢了。
+#
+# 列表型设置（NTP= / FallbackNTP=）在 systemd 里是「追加」语义，不是覆盖：
+# drop-in 里光写 NTP=新地址，主配置原有的 NTP=旧地址会并进来，实测生效值
+# 是「旧 新」，timesyncd 先试旧地址、白等一轮超时。所以 drop-in 里先写一行
+# 空的 NTP= 把列表清掉（man timesyncd.conf: 空值会 reset 且此前赋值全部
+# 失效），再写我们要的 —— 这样主配置一个字都不用动。
+#
+# chrony / ntpd 会在多个源之间自动挑可达的，保留原有的 pool / server 行
+# 不会冲突，也省得去猜哪一行能动。
+#
+# 撤销：timesyncd 删掉那个 drop-in 文件，chrony / ntpd 摘掉标记块。
+# 另外主配置里可能有旧版本留下的标记块（本工具曾短暂写过主配置，
+# 未发布），撤销时一并摘掉，否则它会在「恢复默认」之后继续生效。
 # ============================================================
 
 TIME_TIMESYNCD_DROPIN="${TIME_TIMESYNCD_DROPIN:-/etc/systemd/timesyncd.conf.d/99-linux-toolkit.conf}"
+TIME_TIMESYNCD_CONF="${TIME_TIMESYNCD_CONF:-/etc/systemd/timesyncd.conf}"
 TIME_CHRONY_CONF_DEB="${TIME_CHRONY_CONF_DEB:-/etc/chrony/chrony.conf}"
 TIME_CHRONY_CONF_ALT="${TIME_CHRONY_CONF_ALT:-/etc/chrony.conf}"
 TIME_NTPD_CONF="${TIME_NTPD_CONF:-/etc/ntp.conf}"
@@ -512,13 +524,26 @@ _time_ntp_conf() {
     esac
 }
 
-# 配置里当前的服务器（每行一个）
+# 主配置里是否还留着旧版写的标记块。
+# 本工具曾短暂写过主配置（未发布），那种残留会被 drop-in 盖住 ——
+# 功能上无害，但「恢复默认」之后它还会继续生效，必须能识别出来清掉。
+_time_ntp_stale_block() {
+    [[ "$1" == "systemd-timesyncd" ]] || return 0
+    [[ -r "$TIME_TIMESYNCD_CONF" ]] || return 0
+    grep -qF -- "$TIME_BLOCK_BEGIN" "$TIME_TIMESYNCD_CONF" 2>/dev/null
+}
+
+# 本工具配置的服务器（每行一个）。注意是「我们写的」，不是「系统在用的」——
+# 后者以 timedatectl 报的为准，两回事。
 _time_ntp_servers_current() {
     local conf=''
     case "$1" in
         systemd-timesyncd)
+            # 只有 drop-in 里的才算我们配的：主配置里的 NTP= 是管理员自己写的，
+            # 拿它当「本工具的配置」会张冠李戴
             [[ -r "$TIME_TIMESYNCD_DROPIN" ]] || return 0
-            awk -F= '/^NTP=/ { print $2 }' "$TIME_TIMESYNCD_DROPIN"
+            grep -E '^[[:space:]]*NTP=' "$TIME_TIMESYNCD_DROPIN" 2>/dev/null \
+                | tail -n1 | cut -d= -f2-
             ;;
         chronyd)
             conf="$(_time_ntp_conf chronyd)"
@@ -530,6 +555,16 @@ _time_ntp_servers_current() {
             awk '$1 == "server" { print $2 }' "$TIME_NTPD_CONF"
             ;;
     esac
+}
+
+# 主配置里有没有生效中的 NTP=（非注释、非空）。
+# 我们的 drop-in 一旦存在，就会用空 NTP= 把它整条压掉 —— 那是静默覆盖，
+# 状态页必须说出来，否则管理员的配置失效能查半天。
+_time_ntp_main_has_ntp() {
+    [[ "$1" == "systemd-timesyncd" ]] || return 1
+    [[ -r "$TIME_TIMESYNCD_CONF" ]] || return 1
+    awk -F= '/^[[:space:]]*NTP=[[:space:]]*[^[:space:]]/ { f = 1 } END { exit !f }' \
+        "$TIME_TIMESYNCD_CONF" 2>/dev/null
 }
 
 # 探测服务器是否真的应答：ok / nodns / noresp / unprobe
@@ -559,17 +594,37 @@ _time_probe_ntp() {
     [[ -n "$resp" ]] && printf 'ok' || printf 'noresp'
 }
 
-# 把服务器写进配置。只新增，不动用户原有的行；重复执行不会累积。
+# 把服务器写进配置。
+#
+# timesyncd 写 drop-in：整个文件都是我们的，直接覆盖，不需要标记块。
+# 里面的空 NTP= 是必需的（见本节开头的说明），少了它主配置的地址会并进来。
+#
+# chrony / ntpd 在主配置末尾追加带标记的块，用户原有的行一律不动，
+# 重复执行不会累积（先把旧块摘掉再写新的）。
 _time_ntp_servers_write() {
-    local impl="$1" servers="$2" conf='' tmp='' mode='' s=''
+    local impl="$1" servers="$2" conf='' tmp='' s=''
 
+    conf="$(_time_ntp_conf "$impl")" || return 1
+
+    # ---- timesyncd：写 drop-in ----
     if [[ "$impl" == "systemd-timesyncd" ]]; then
-        mkdir -p "$(dirname "$TIME_TIMESYNCD_DROPIN")" || return 1
-        printf '[Time]\nNTP=%s\n' "$servers" >"$TIME_TIMESYNCD_DROPIN" || return 1
+        mkdir -p "$(dirname "$conf")" || return 1
+        tmp="$(mktemp)" || return 1
+        {
+            printf '# 由 Linux 一键配置脚本生成，请勿手工编辑\n'
+            printf '# 生成方式: 「时间与时区 → 设置 NTP 服务器」\n'
+            printf '[Time]\n'
+            printf 'NTP=\n'                    # 清空列表，挡住主配置里原有的 NTP=
+            printf 'NTP=%s\n' "$servers"
+            printf 'FallbackNTP=\n'           # 留空，避免退回编译进二进制的 pool
+        } >"$tmp" || { rm -f "$tmp"; return 1; }
+
+        install -m 0644 "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+        rm -f "$tmp"
         return 0
     fi
 
-    conf="$(_time_ntp_conf "$impl")" || return 1
+    # ---- chrony / ntpd：主配置里维护标记块 ----
     tmp="$(mktemp)" || return 1
 
     # 先摘掉上次写的块，再追加新的
@@ -580,6 +635,13 @@ _time_ntp_servers_write() {
             !skip
         ' "$conf" >"$tmp" || { rm -f "$tmp"; return 1; }
     fi
+
+    # 原文件末尾没有换行时先补一个，否则标记会粘在最后一行后面，
+    # 之后按整行比对标记就再也摘不掉了
+    if [[ -s "$tmp" && -n "$(tail -c 1 "$tmp" 2>/dev/null)" ]]; then
+        printf '\n' >>"$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+
     {
         printf '%s\n' "$TIME_BLOCK_BEGIN"
         for s in $servers; do printf 'server %s iburst\n' "$s"; done
@@ -587,8 +649,7 @@ _time_ntp_servers_write() {
     } >>"$tmp" || { rm -f "$tmp"; return 1; }
 
     if [[ -e "$conf" ]]; then
-        mode="$(stat -c %a "$conf" 2>/dev/null || echo 644)"
-        install -m "$mode" "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+        install_keep_mode "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
     else
         install -m 0644 "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
     fi
@@ -596,16 +657,21 @@ _time_ntp_servers_write() {
     return 0
 }
 
-# 撤掉本工具写的配置，回到发行版默认
+# 撤掉本工具写的那一份，回到发行版默认。
+#   timesyncd      删掉 drop-in 文件（它整个都是我们的）
+#   chrony / ntpd  从主配置里摘掉标记块
 _time_ntp_servers_clear() {
-    local impl="$1" conf='' tmp='' mode=''
+    local impl="$1" conf='' tmp=''
+
+    conf="$(_time_ntp_conf "$impl")" || return 1
 
     if [[ "$impl" == "systemd-timesyncd" ]]; then
-        rm -f "$TIME_TIMESYNCD_DROPIN"
+        rm -f "$conf" || return 1
+        # 目录是 mkdir -p 建的（也可能本来就为别的 drop-in 存在），空了就收掉
+        rmdir "$(dirname "$conf")" 2>/dev/null || true
         return 0
     fi
 
-    conf="$(_time_ntp_conf "$impl")" || return 1
     [[ -r "$conf" ]] || return 0
     grep -qF -- "$TIME_BLOCK_BEGIN" "$conf" || return 0   # 没有我们的块，什么都不用做
 
@@ -616,15 +682,27 @@ _time_ntp_servers_clear() {
         !skip
     ' "$conf" >"$tmp" || { rm -f "$tmp"; return 1; }
 
-    mode="$(stat -c %a "$conf" 2>/dev/null || echo 644)"
-    install -m "$mode" "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
+    install_keep_mode "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
+    return 0
+}
 
-    # 摘掉我们的块之后一个字都不剩，说明这个文件本来就是为它建的，
-    # 一并删掉，避免留一个空配置文件让人困惑（注释行也算内容，会保留）
-    if ! grep -qvE '^[[:space:]]*$' "$conf" 2>/dev/null; then
-        rm -f "$conf"
-    fi
+# 摘掉主配置里可能残留的旧版标记块（本工具曾短暂写过主配置，未发布）。
+# 无害但会误导：drop-in 在时它不起作用，「恢复默认」删掉 drop-in 之后
+# 它会重新生效，用户会以为恢复失败。所以撤销时要一并清掉。
+_time_ntp_stale_block_clear() {
+    local tmp='' mode=''
+
+    _time_ntp_stale_block systemd-timesyncd || return 0
+    tmp="$(mktemp)" || return 1
+    awk -v b="$TIME_BLOCK_BEGIN" -v e="$TIME_BLOCK_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip
+    ' "$TIME_TIMESYNCD_CONF" >"$tmp" || { rm -f "$tmp"; return 1; }
+
+    install_keep_mode "$tmp" "$TIME_TIMESYNCD_CONF" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
     return 0
 }
 
@@ -632,6 +710,7 @@ _time_ntp_conf_snapshot() {
     local conf
     TIME_SRV_SNAP_DIR=''
     TIME_SRV_SNAP_EXISTED=''
+    TIME_SRV_SNAP_STALE_EXISTED=''
     TIME_SRV_CONF="$(_time_ntp_conf "$1")" || return 1
     conf="$TIME_SRV_CONF"
 
@@ -639,6 +718,13 @@ _time_ntp_conf_snapshot() {
     if [[ -e "$conf" ]]; then
         TIME_SRV_SNAP_EXISTED=1
         cp -a "$conf" "$TIME_SRV_SNAP_DIR/conf" 2>/dev/null || return 1
+    fi
+
+    # 主配置里若有旧版残留的标记块，撤销时会被改动，一并备份
+    if _time_ntp_stale_block "$1"; then
+        TIME_SRV_SNAP_STALE_EXISTED=1
+        cp -a "$TIME_TIMESYNCD_CONF" "$TIME_SRV_SNAP_DIR/stale_conf" 2>/dev/null \
+            || { rm -rf "$TIME_SRV_SNAP_DIR"; TIME_SRV_SNAP_DIR=''; return 1; }
     fi
     return 0
 }
@@ -652,34 +738,45 @@ _time_ntp_conf_snapshot_cleanup() {
 _time_ntp_conf_rollback() {
     [[ -n "${TIME_SRV_SNAP_DIR:-}" && -d "${TIME_SRV_SNAP_DIR:-}" ]] || return 0
     if [[ -n "${TIME_SRV_SNAP_EXISTED:-}" ]]; then
+        mkdir -p "$(dirname "$TIME_SRV_CONF")" 2>/dev/null
         cp -a "$TIME_SRV_SNAP_DIR/conf" "$TIME_SRV_CONF" 2>/dev/null || true
     else
         rm -f "$TIME_SRV_CONF"      # 原本没有就得删掉，不能留个我们建的文件
+    fi
+    if [[ -n "${TIME_SRV_SNAP_STALE_EXISTED:-}" ]]; then
+        cp -a "$TIME_SRV_SNAP_DIR/stale_conf" "$TIME_TIMESYNCD_CONF" 2>/dev/null || true
     fi
     _time_ntp_conf_snapshot_cleanup
     return 0
 }
 
 # 写完后确认服务器真的进了生效配置。
-# timesyncd 用 systemd-analyze cat-config 看合并后的结果 —— 这能证明
-# drop-in 的路径与写法都被认了，而不只是「文件写出去了」。
+#
+# 先查我们自己的文件（drop-in / 标记块），再确认 systemd 确实读到了它。
+# 不能只查 systemd-analyze cat-config 的结果：那里面混着主配置和其它
+# drop-in 的内容，只要别处出现过同一个服务器名就能把检查喂饱，
+# 「文件没写成」也能蒙混过关。
 _time_ntp_servers_verify() {
     local impl="$1" servers="$2" conf='' eff='' s=''
-
-    if [[ "$impl" == "systemd-timesyncd" ]] && have_cmd systemd-analyze; then
-        if eff="$(systemd-analyze cat-config systemd/timesyncd.conf 2>/dev/null)" && [[ -n "$eff" ]]; then
-            for s in $servers; do
-                [[ "$eff" == *"$s"* ]] || { printf '生效配置里没有 %s' "$s"; return 1; }
-            done
-            return 0
-        fi
-    fi
 
     conf="$(_time_ntp_conf "$impl")"
     [[ -r "$conf" ]] || { printf '%s 读不到' "$conf"; return 1; }
     for s in $servers; do
-        grep -qF -- "$s" "$conf" || { printf '配置里没有 %s' "$s"; return 1; }
+        grep -qF -- "$s" "$conf" || { printf '%s 里没有 %s' "$conf" "$s"; return 1; }
     done
+
+    # timesyncd 再确认 systemd 认得这个 drop-in：cat-config 的合并结果里
+    # 应当出现它的路径（有 systemd-analyze 才查，没有就以上一步为准）。
+    #
+    # 只在路径是默认位置时查：systemd 只加载 /etc/systemd 下的文件，
+    # 把路径指到别处（测试场景）cat-config 自然看不到，那种情况查了只会
+    # 误报失败，反而把「文件确实写对了」这个已经验过的事实盖过去。
+    if [[ "$impl" == "systemd-timesyncd" ]] && have_cmd systemd-analyze \
+       && [[ "$conf" == /etc/systemd/timesyncd.conf.d/* ]]; then
+        eff="$(systemd-analyze cat-config systemd/timesyncd.conf 2>/dev/null)" || return 0
+        [[ -n "$eff" ]] || return 0
+        [[ "$eff" == *"$conf"* ]] || { printf 'systemd 没有加载 %s' "$conf"; return 1; }
+    fi
     return 0
 }
 
@@ -732,33 +829,43 @@ _time_ntp_reload() {
 
 # 恢复发行版默认
 _time_ntp_server_restore() {
-    local impl="$1" conf=''
+    local impl="$1" conf='' stale=0
 
     conf="$(_time_ntp_conf "$impl")"
+    _time_ntp_stale_block "$impl" && stale=1
+
+    local has_ours=0
+    [[ -e "$conf" ]] && has_ours=1
+
+    # timesyncd 那一路没写过就是没写过：drop-in 不存在、主配置也没有残留
+    if (( ! has_ours )) && (( ! stale )); then
+        module_begin "恢复默认校时服务器"
+        log_info "本工具没有写过配置，无需删除。"
+        module_end
+        return 0
+    fi
 
     module_begin "恢复默认校时服务器"
     ui_section "将删除"
-    if [[ "$impl" == "systemd-timesyncd" ]]; then
-        if [[ -e "$TIME_TIMESYNCD_DROPIN" ]]; then
-            printf '  %s-%s %s\n' "$C_RED" "$C_RESET" "$TIME_TIMESYNCD_DROPIN"
+    if (( has_ours )); then
+        if [[ "$impl" == "systemd-timesyncd" ]]; then
+            printf '  %s-%s %s（本工具的 drop-in）\n' "$C_RED" "$C_RESET" "$conf"
         else
-            printf '  %s本工具没有写过配置，无需删除%s\n' "$C_DIM" "$C_RESET"
-            module_end
-            return 0
-        fi
-    else
-        if [[ -r "$conf" ]] && grep -qF -- "$TIME_BLOCK_BEGIN" "$conf"; then
             printf '  %s-%s %s 中本工具写的那一段（标记之间）\n' "$C_RED" "$C_RESET" "$conf"
-            printf '  %s  用户原有的 pool / server 行一律保留%s\n' "$C_DIM" "$C_RESET"
-        else
-            printf '  %s本工具没有写过配置，无需删除%s\n' "$C_DIM" "$C_RESET"
-            module_end
-            return 0
         fi
+    fi
+    if (( stale )); then
+        printf '  %s-%s %s 中本工具写的那一段（旧版本残留）\n' \
+            "$C_RED" "$C_RESET" "$TIME_TIMESYNCD_CONF"
     fi
 
     ui_section "不受影响"
-    printf '  %s发行版自带的配置文件、其它服务器配置一律不动%s\n' "$C_DIM" "$C_RESET"
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        printf '  %s主配置 %s 一字不动%s\n' "$C_DIM" "$TIME_TIMESYNCD_CONF" "$C_RESET"
+    else
+        printf '  %s标记块以外的内容（含发行版自带的设置）一律保留%s\n' "$C_DIM" "$C_RESET"
+        printf '  %s用户原有的 pool / server 行不会被动到%s\n' "$C_DIM" "$C_RESET"
+    fi
     printf '  %s校时服务本身不卸载、不停止%s\n' "$C_DIM" "$C_RESET"
 
     printf '\n'
@@ -774,8 +881,14 @@ _time_ntp_server_restore() {
         module_end
         return 1
     fi
-    if ! _time_ntp_servers_clear "$impl"; then
+    if (( has_ours )) && ! _time_ntp_servers_clear "$impl"; then
         log_err "删除失败，正在回滚..."
+        _time_ntp_conf_rollback
+        module_end
+        return 1
+    fi
+    if (( stale )) && ! _time_ntp_stale_block_clear; then
+        log_err "清理主配置里的残留失败，正在回滚..."
         _time_ntp_conf_rollback
         module_end
         return 1
@@ -886,25 +999,46 @@ time_ntp_server() {
     ui_section "将写入"
     ui_kv "配置文件" "$conf"
     if [[ "$impl" == "systemd-timesyncd" ]]; then
-        ui_kv "形式" "drop-in 文件（发行版自带的 timesyncd.conf 不动）"
+        ui_kv "形式" "整份写入（这个文件由本工具独占）"
         printf '  %s[Time]%s\n' "$C_DIM" "$C_RESET"
         printf '  %sNTP=%s%s\n' "$C_BCYAN" "$servers" "$C_RESET"
+        printf '  %sFallbackNTP=%s\n' "$C_BCYAN" "$C_RESET"
     else
         ui_kv "形式" "在配置文件末尾追加一个带标记的块"
+        printf '  %s%s%s\n' "$C_DIM" "$TIME_BLOCK_BEGIN" "$C_RESET"
         for s in $servers; do
             printf '  %s+%s server %s iburst\n' "$C_GREEN" "$C_RESET" "$s"
         done
+        printf '  %s%s%s\n' "$C_DIM" "$TIME_BLOCK_END" "$C_RESET"
     fi
 
     ui_section "不会改动"
     if [[ "$impl" == "systemd-timesyncd" ]]; then
-        printf '  %s发行版自带的 /etc/systemd/timesyncd.conf 一字不动%s\n' "$C_DIM" "$C_RESET"
+        printf '  %s主配置 %s 一字不动%s\n' "$C_DIM" "$TIME_TIMESYNCD_CONF" "$C_RESET"
+        printf '  %s它是 systemd 包的 conffile，交给 dpkg 管，升级时不会有提示%s\n' \
+            "$C_DIM" "$C_RESET"
     else
-        printf '  %s已有的 pool / server 行一律保留 —— %s 会在多个源之间自动挑可达的%s\n' \
+        printf '  %s标记块以外的内容一律保留，包括发行版自带的那份配置%s\n' "$C_DIM" "$C_RESET"
+        printf '  %s已有的 pool / server 行不会冲突：%s 会在多个源之间自动挑可达的%s\n' \
             "$C_DIM" "$impl" "$C_RESET"
-        printf '  %s只动标记块之内的内容%s\n' "$C_DIM" "$C_RESET"
     fi
     printf '  %s时区、NTP 开关状态、软件包一律不动%s\n' "$C_DIM" "$C_RESET"
+    if [[ "$impl" == "systemd-timesyncd" ]]; then
+        printf '\n  %sdrop-in 里的空 NTP= 是必需的：systemd 对 NTP= 是追加语义，%s\n' \
+            "$C_DIM" "$C_RESET"
+        printf '  %s不先清空的话主配置里的地址会并进来、被优先尝试。%s\n' "$C_DIM" "$C_RESET"
+        printf '  %sFallbackNTP= 同样留空，免得主服务器一不通就退回 pool.ntp.org。%s\n' \
+            "$C_DIM" "$C_RESET"
+    fi
+
+    # 主配置里若有旧版残留的标记块，撤销时会被清掉 —— 提前说清楚
+    local stale=0
+    _time_ntp_stale_block "$impl" && stale=1
+    if (( stale )); then
+        ui_section "将清理"
+        printf '  %s-%s %s 中本工具写的那一段（旧版本残留）\n' \
+            "$C_RED" "$C_RESET" "$TIME_TIMESYNCD_CONF"
+    fi
 
     ui_section "将备份（仅失败回滚用，成功后删除）"
     if [[ -e "$conf" ]]; then
@@ -943,6 +1077,15 @@ time_ntp_server() {
         return 1
     fi
     log_ok "已写入 $conf"
+
+    # 旧残留一并清掉：留着它在「恢复默认」删掉 drop-in 之后会重新生效
+    if (( stale )); then
+        if _time_ntp_stale_block_clear; then
+            log_ok "已清理 $TIME_TIMESYNCD_CONF 中的旧配置残留"
+        else
+            log_warn "清理 $TIME_TIMESYNCD_CONF 中的旧配置残留失败，请手动检查。"
+        fi
+    fi
 
     # ---- 验证 ----
     if ! mode="$(_time_ntp_servers_verify "$impl" "$servers")"; then
@@ -1015,7 +1158,7 @@ time_status() {
     fi
 
     ui_section "自动校时"
-    local impl='' srv='' srvlist=''
+    local impl='' srv='' srvlist='' main_ntp=''
     impl="$(_time_ntp_impl || true)"
 
     if _time_have_systemd; then
@@ -1037,13 +1180,30 @@ time_status() {
         ui_kv "校时服务" "${impl:-未安装}"
     fi
 
+    if _time_ntp_stale_block "$impl"; then
+        # 有 drop-in 时它不起作用，没有时它会生效 —— 两种情况都得说，
+        # 否则「删了 drop-in 怎么服务器还在」会变成一桩悬案
+        printf '  %s主配置 %s 里还有本工具写的一段（旧版本残留）%s\n' \
+            "$C_YELLOW" "$TIME_TIMESYNCD_CONF" "$C_RESET"
+        printf '  %s用「设置 NTP 服务器 → 恢复默认」可以把它清掉。%s\n' "$C_DIM" "$C_RESET"
+    fi
+
     if [[ -n "$impl" ]]; then
         srvlist="$(_time_ntp_servers_current "$impl" | tr '\n' ' ')"
         srvlist="${srvlist% }"
         if [[ -n "$srvlist" ]]; then
-            ui_kv "已配服务器" "$srvlist"
+            ui_kv "本工具配置" "$srvlist"
         else
-            ui_kv "已配服务器" "本工具未配置过（用发行版默认）"
+            ui_kv "本工具配置" "未配置过（用发行版默认）"
+        fi
+        # 主配置里管理员自己写的 NTP= 正在被我们的 drop-in 压掉，得说清楚
+        if [[ -n "$srvlist" ]] && _time_ntp_main_has_ntp "$impl"; then
+            main_ntp="$(awk -F= '/^[[:space:]]*NTP=[[:space:]]*[^[:space:]]/ { v = $2 } END { print v }' \
+                "$TIME_TIMESYNCD_CONF" 2>/dev/null)"
+            printf '  %s主配置里的 NTP=%s 已被本工具的 drop-in 覆盖（不生效）%s\n' \
+                "$C_YELLOW" "${main_ntp:-…}" "$C_RESET"
+            printf '  %s要改回来: 用「恢复默认」删掉 drop-in，或直接重设服务器%s\n' \
+                "$C_DIM" "$C_RESET"
         fi
         if _time_have_systemd; then
             srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
