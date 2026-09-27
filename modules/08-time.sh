@@ -416,6 +416,27 @@ _time_ntp_active() {
     systemctl is-active --quiet "$1.service" 2>/dev/null
 }
 
+# 向 timesyncd 问「当前在跟哪个服务器同步」，拿不到就输出空串。
+#
+# 不能直接调 timedatectl：timesync1 在 D-Bus 上配了自动激活，服务处于
+# 「已启用但没在跑」时，这个查询会把守护进程拉起来、并一直阻塞到它启动
+# 完成才返回 —— 一个只读的状态行会卡住界面，还顺手把用户手动停掉的服务
+# 又打开了。实测（ExecStartPre 塞 sleep 20 复现）卡满 20 秒。
+# 所以先确认服务在跑；没在跑就问不出有意义的值，本来也没有可显示的。
+#
+# timeout 是第二道闸：服务在跑但响应异常慢时，不让界面跟着一起等。
+_time_td_timesync_srv() {
+    local srv=''
+    _time_have_systemd || return 0
+    _time_ntp_active systemd-timesyncd || return 0
+    have_cmd timeout || return 0
+
+    srv="$(timeout 3 timedatectl show-timesync --property=ServerName --value 2>/dev/null)" \
+        || return 0
+    printf '%s' "$srv"
+    return 0
+}
+
 # 需要装的包名；已经有校时服务了就输出空串
 _time_ntp_pkg() {
     _time_ntp_unit >/dev/null && return 0
@@ -802,7 +823,7 @@ _time_ntp_reload() {
                 return 0
             fi
             for (( i=0; i<10; i++ )); do
-                srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+                srv="$(_time_td_timesync_srv)"
                 for s in $servers; do
                     [[ "$srv" == *"$s"* ]] && { log_ok "已连上 $srv"; return 0; }
                 done
@@ -931,7 +952,7 @@ time_ntp_server() {
         ui_kv "当前服务器" "本工具未配置过"
     fi
     if [[ "$impl" == "systemd-timesyncd" ]]; then
-        srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+        srv="$(_time_td_timesync_srv)"
         [[ -n "$srv" ]] && ui_kv "正在使用" "$srv"
     fi
 
@@ -1206,7 +1227,7 @@ time_status() {
                 "$C_DIM" "$C_RESET"
         fi
         if _time_have_systemd; then
-            srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+            srv="$(_time_td_timesync_srv)"
             [[ -n "$srv" ]] && ui_kv "正在使用" "$srv"
         fi
     fi
@@ -1739,7 +1760,7 @@ time_ntp_on() {
     fi
 
     local srv
-    srv="$(timedatectl show-timesync --property=ServerName --value 2>/dev/null)"
+    srv="$(_time_td_timesync_srv)"
     [[ -n "$srv" ]] && ui_kv "同步服务器" "$srv"
     ui_kv "本地时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
