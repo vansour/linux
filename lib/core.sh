@@ -34,12 +34,29 @@ fi
 # ------------------------------------------------------------
 LOG_LEVEL="${LOG_LEVEL:-info}"   # debug|info|warn|error
 LOG_FILE="${LOG_FILE:-/var/log/linux-toolkit.log}"
+# 单个日志文件的上限，超过就滚动成 .1（只留一份历史）。
+# 不设上限的话，反复装包 / 排障的机器上这个文件会一直涨。
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-1048576}"   # 1 MiB
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# 超限就把当前日志滚成 .1，覆盖上一份历史。
+# 一切失败都静默放过 —— 日志记不下来不该影响正常流程。
+_log_rotate() {
+    [[ -f "$LOG_FILE" ]] || return 0
+    [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || return 0
+    local size
+    size="$(stat -c %s "$LOG_FILE" 2>/dev/null)" || return 0
+    [[ "$size" =~ ^[0-9]+$ ]] || return 0
+    (( size >= LOG_MAX_BYTES )) || return 0
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || rm -f "$LOG_FILE" 2>/dev/null
+    return 0
+}
 
 _log_write() {
     # 尽量写日志文件，失败静默忽略（非 root 或目录不可写时）
     [[ -n "$LOG_FILE" ]] || return 0
+    _log_rotate
     printf '[%s] [%-5s] %s\n' "$(_ts)" "$1" "$2" >>"$LOG_FILE" 2>/dev/null || true
 }
 
@@ -114,6 +131,16 @@ require_root() {
     if ! is_root; then
         die "此操作需要 root 权限，请使用 sudo 重新运行。"
     fi
+}
+
+# 把 $1 装到 $2，沿用 $2 原有的权限（$2 不存在则 0644）。
+# 不能一律 install -m 0644：/etc/fstab、/etc/sysctl.conf 这类文件的权限
+# 未必是 0644，写死的 mode 会顺手把原权限抹掉。
+install_keep_mode() {
+    local src="$1" dest="$2" mode
+    mode="$(stat -c %a "$dest" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]+$ ]] || mode=0644
+    install -m "$mode" "$src" "$dest"
 }
 
 # 执行命令并记录到日志（失败返回非 0，由调用方决定如何处理）
