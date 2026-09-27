@@ -499,22 +499,20 @@ TIME_BLOCK_END='# <<< linux-toolkit ntp servers <<<'
 
 # 备选服务器。国内可达性优先，国际的放后面。
 NTP_SERVER_LIST=(
-    "ntp.aliyun.com"
     "ntp.tencent.com"
-    "cn.pool.ntp.org"
-    "cn.ntp.org.cn"
-    "ntp.ntsc.ac.cn"
+    "ntp.aliyun.com"
     "time.cloudflare.com"
-    "pool.ntp.org"
+    "time.google.com"
+    "time.windows.com"
+    "time.apple.com"
 )
 NTP_SERVER_NOTE=(
-    "阿里云"
     "腾讯云"
-    "NTP Pool 中国"
-    "国家授时中心"
-    "国家授时中心 NTSC"
+    "阿里云"
     "Cloudflare"
-    "国际 NTP Pool"
+    "Google"
+    "Windows"
+    "Apple"
 )
 
 # 当前在用的校时实现。systemd 单元优先，其次按命令找 ——
