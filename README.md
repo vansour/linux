@@ -2,7 +2,9 @@
 
 纯 Bash 交互式 Linux 初始化 / 配置工具。零依赖，任何 Linux 发行版都能跑。
 
-> 当前为 **v0.0.1 框架版**，只搭好了骨架和菜单系统，功能待逐项添加。
+> 滚动更新，不带版本号：`install.sh` 始终由 `main` 分支的源码构建，
+> 用户每次运行拉到的就是最新版。系统信息 / 系统更新 / 常用工具 / 网络设置 /
+> Swap / 时间与时区六个模块已可用，用户管理与服务管理仍是占位。
 
 ## 特性
 
@@ -59,13 +61,13 @@ git config core.hooksPath .githooks
 | 选项 | 说明 |
 | --- | --- |
 | `-h, --help` | 帮助 |
-| `-V, --version` | 版本号 |
 | `-l, --list` | 列出已注册模块后退出（不需要终端，可用于 CI 检查） |
 | `-d, --debug` | 输出调试日志 |
 | `--no-color` | 禁用彩色（也支持 `NO_COLOR=1` 环境变量） |
 | `--log FILE` | 指定日志文件，默认 `/var/log/linux-toolkit.log` |
 
-所有操作写入日志文件，方便出问题后回溯。
+所有操作写入日志文件，方便出问题后回溯。日志超过 1 MiB 自动滚动为
+`<文件>.1`（只保留一份历史），可用 `LOG_MAX_BYTES` 环境变量调整。
 
 ## 目录结构
 
@@ -182,10 +184,11 @@ register_module "firewall" "防火墙" "menu_firewall" "ufw / firewalld" "debian
 | `pkg_refresh` | 刷新软件源缓存 |
 | `pkg_install 包...` | 安装（自动适配 apt/dnf/pacman/apk/zypper） |
 | `ensure_pkg 命令 包名` | 命令不存在才安装 |
+| `install_keep_mode 源 目标` | 写回配置文件时沿用目标原有权限（不存在则 0644） |
 
 ### 已有全局变量
 
-`APP_NAME` `APP_VERSION` `SINGLE_FILE` `DISTRO_*` `ARCH` `KERNEL` `HOSTNAME_SHORT` `SCRIPT_DIR` `LIB_DIR` `MODULES_DIR`
+`APP_NAME` `SINGLE_FILE` `DISTRO_*` `ARCH` `KERNEL` `HOSTNAME_SHORT` `SCRIPT_DIR` `LIB_DIR` `MODULES_DIR`
 
 ## 开发注意
 
